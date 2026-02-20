@@ -83,6 +83,24 @@ def _dedup_keep_order(items: list[dict], key_field: str = "key") -> list[dict]:
     return out
 
 
+def _list_debug_files() -> set[str]:
+    if not DEBUG_DIR.exists():
+        return set()
+    return set(p.name for p in DEBUG_DIR.glob("*") if p.is_file())
+
+
+def _filter_site_debug_files(site_key: str, files: set[str]) -> list[str]:
+    # debug prefix에 site_key가 들어가는 경우를 우선적으로 추출
+    safe = re.sub(r"[^0-9A-Za-z가-힣]+", "_", site_key).strip("_")
+    picked = []
+    for f in sorted(files):
+        if safe in f:
+            picked.append(f)
+    # site_key가 파일명에 안 들어가도 error_/list_no_results 같은 공용 파일이 생성될 수 있으니
+    # 아무것도 못 찾으면 전체 새 파일명을 그대로 사용
+    return picked if picked else sorted(files)
+
+
 def _save_debug(page, prefix: str):
     stamp = _stamp()
     shot = DEBUG_DIR / f"{prefix}_{stamp}.png"
@@ -96,7 +114,6 @@ def _save_debug(page, prefix: str):
     except Exception:
         pass
     print("[debug] saved", str(shot), str(html))
-    return str(shot), str(html)
 
 
 def _abs_url(base: str, href: str) -> str:
@@ -489,7 +506,6 @@ def scrape_ann365(page) -> list[dict]:
     )
 
 
-# Slack 표시명 한글화
 SITES = [
     {"site": "O-Lens", "display": "오렌즈", "mode": "normal", "fn": scrape_olens},
     {"site": "Hapa Kristin", "display": "하파크리스틴", "mode": "desktop", "fn": scrape_hapakristin},
@@ -504,11 +520,6 @@ SITES = [
     {"site": "yourly", "display": "유얼리", "mode": "normal", "fn": scrape_yourly},
     {"site": "i-dol", "display": "아이돌렌즈", "mode": "normal", "fn": scrape_i_dol},
 ]
-
-# “0건이면 이상징후”로 보고 테스트 채널에 경고를 보내고 싶은 사이트
-WARN_IF_EMPTY_SITES = {
-    "Hapa Kristin",
-}
 
 
 def main():
@@ -535,12 +546,15 @@ def main():
             fn = cfg["fn"]
 
             print("\n[main] site:", site_key, "(", site_name, ")")
-            start = time.time()
 
+            # 사이트 실행 전 debug 파일 목록 스냅샷
+            debug_before = _list_debug_files()
+
+            start = time.time()
             context = None
             page = None
             items = []
-            failed_reason = ""
+            site_exception = ""
 
             try:
                 if mode == "desktop":
@@ -551,12 +565,9 @@ def main():
                 items = fn(page) or []
                 items = _dedup_keep_order(items)
 
-                if (site_key in WARN_IF_EMPTY_SITES) and (len(items) == 0):
-                    failed_reason = "수집 결과가 0건입니다(메뉴/구조 변경 가능)."
-
             except Exception as e:
-                failed_reason = f"예외 발생: {repr(e)}"
-                print("[main] site error:", site_key, failed_reason)
+                site_exception = repr(e)
+                print("[main] site error:", site_key, site_exception)
                 if page is not None:
                     _save_debug(page, f"error_{site_key.replace(' ', '_')}")
                 items = []
@@ -571,10 +582,26 @@ def main():
             elapsed = time.time() - start
             print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
-            # 실패/의심 알림은 테스트 채널로
-            if failed_reason:
+            # 사이트 실행 후 debug 파일 목록 비교 → 새 파일 있을 때만 경고
+            debug_after = _list_debug_files()
+            new_debug_files = debug_after - debug_before
+
+            if new_debug_files:
                 run_url = _run_url()
-                msg = f"[수집 실패/의심] {site_name}\n사유: {failed_reason}\nRun: {run_url}".strip()
+                picked = _filter_site_debug_files(site_key, new_debug_files)
+                # 너무 길면 8개만
+                picked = picked[:8]
+                reason = "debug 파일이 새로 생성되었습니다(수집 실패/구조 변경 가능)."
+                if site_exception:
+                    reason = f"예외로 debug 생성: {site_exception}"
+
+                msg = (
+                    f"[수집 경고] {site_name}\n"
+                    f"{reason}\n"
+                    f"새 debug: {', '.join(picked)}\n"
+                    f"Run: {run_url}"
+                ).strip()
+
                 try:
                     post_slack_test(msg)
                 except Exception as e:
