@@ -45,6 +45,16 @@ jobs:
         run: |
           python scraper/main.py
 
+      - name: Run scraper
+        env:
+          SLACK_WEBHOOK_URL_PROD: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
+          SLACK_WEBHOOK_URL_TEST: ${{ secrets.SLACK_WEBHOOK_URL_TEST }}
+        run: |
+          git rev-parse HEAD
+          ls -al scraper
+          sed -n '1,80p' scraper/main.py
+          python scraper/main.py
+
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
