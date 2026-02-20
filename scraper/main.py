@@ -19,12 +19,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# 운영 시작 시 False 권장 (첫 실행 도배 방지용은 True)
+# 운영 시작 시 보통 False 권장 (첫 실행 도배 방지용은 True)
+# 이미 state가 저장된 상태라면 False로 두셔도 괜찮습니다.
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
 
-# “한 사이트에서 너무 오래 끄는 느낌”을 줄이기 위한 기본 제한(밀리초)
 NAV_TIMEOUT_MS = 45_000
 ACTION_TIMEOUT_MS = 20_000
 
@@ -417,12 +417,6 @@ def scrape_gemhour(page) -> list[dict]:
 
 
 def scrape_shop_winc(page) -> list[dict]:
-    """
-    shop.winc.app:
-    Flutter Web이라 headless에서 화면이 하얗게 렌더링될 수 있음.
-    HTML에 SEO용으로 숨겨진 nav(display:none)에 /event/{id} 링크가 포함되는 경우가 있어,
-    클릭 대신 /event/ 링크를 직접 수집한다.
-    """
     home = "https://shop.winc.app/"
     safe_goto(page, home, "winc_home")
 
@@ -446,29 +440,30 @@ def scrape_shop_winc(page) -> list[dict]:
     results = _dedup_keep_order(results)
     if not results:
         _save_debug(page, "winc_no_event_links")
-        # fallback: 홈 자체라도 키로 저장(변경 감지 보조)
         results = [{"key": "winc:home", "url": home, "title": "이벤트(홈)"}]
 
     return results
 
 
 # -----------------------------
-# Runner (스레드 없이 순차 실행)
+# Slack 표시명(display) 분리된 사이트 목록
+# site: state 저장용 키 (기존 값 유지)
+# display: Slack 표시용 이름 (원하는 대로 수정)
 # -----------------------------
 
 SITES = [
-    {"site": "olens", "display": "O-Lens", "fn": scrape_olens},
-    {"site": "hapakristin", "display": "Hapa Kristin", "fn": scrape_hapakristin},
-    {"site": "lensme", "display": "Lens-me", "fn": scrape_lensme},
-    {"site": "myfipn", "display": "MYFiPN", "fn": scrape_myfipn},
-    {"site": "chuulens", "display": "CHUU LENS", "fn": scrape_chuulens},
-    {"site": "gemhour", "display": "Gemhour", "fn": scrape_gemhour},
-    {"site": "isha", "display": "i-sha", "fn": scrape_i_sha},
-    {"site": "winc", "display": "Winc", "fn": scrape_shop_winc},
+    {"site": "O-Lens", "display": "O-Lens", "fn": scrape_olens},
+    {"site": "Hapa Kristin", "display": "Hapa Kristin", "fn": scrape_hapakristin},
+    {"site": "Lens-me", "display": "Lens-me", "fn": scrape_lensme},
+    {"site": "MYFiPN", "display": "MYFiPN", "fn": scrape_myfipn},
+    {"site": "CHUU Lens", "display": "CHUU LENS", "fn": scrape_chuulens},
+    {"site": "Gemhour", "display": "Gemhour", "fn": scrape_gemhour},
+    {"site": "i-sha", "display": "i-sha", "fn": scrape_i_sha},
+    {"site": "shop.winc.app", "display": "Winc", "fn": scrape_shop_winc},
     {"site": "ann365", "display": "ANN365", "fn": scrape_ann365},
     {"site": "lenbling", "display": "Lenbling", "fn": scrape_lenbling},
     {"site": "yourly", "display": "Yourly", "fn": scrape_yourly},
-    {"site": "idol", "display": "i-dol", "fn": scrape_i_dol},
+    {"site": "i-dol", "display": "i-dol", "fn": scrape_i_dol},
 ]
 
 
@@ -491,10 +486,11 @@ def main():
         )
 
         for cfg in SITES:
-            site = cfg["site"]
+            site_key = cfg["site"]                  # state 저장 키
+            site_name = cfg.get("display", site_key)  # Slack 표시명
             fn = cfg["fn"]
 
-            print("\n[main] site:", site)
+            print("\n[main] site:", site_key, "(", site_name, ")")
             start = time.time()
 
             context = None
@@ -505,9 +501,9 @@ def main():
                 context, page = new_page(browser)
                 items = fn(page) or []
             except Exception as e:
-                print("[main] site error:", site, repr(e))
+                print("[main] site error:", site_key, repr(e))
                 if page is not None:
-                    _save_debug(page, f"error_{site.replace(' ', '_')}")
+                    _save_debug(page, f"error_{site_key.replace(' ', '_')}")
                 items = []
             finally:
                 try:
@@ -520,14 +516,14 @@ def main():
             items = _dedup_keep_order(items)
             print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
-            seen_set = set(state["seen"].get(site, []))
+            seen_set = set(state["seen"].get(site_key, []))
 
             if INIT_SILENT and not seen_set and items:
                 for it in items:
                     k = it.get("key")
                     if k:
                         seen_set.add(k)
-                state["seen"][site] = sorted(seen_set)
+                state["seen"][site_key] = sorted(seen_set)
                 any_state_changed = True
                 print("[main] INIT_SILENT: initialized state only")
                 continue
@@ -539,11 +535,11 @@ def main():
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
                     url = it.get("url") or ""
-                    msg = f"[{site} 신규 프로모션]\n{title}\n{url}".strip()
+                    msg = f"[{site_name} 신규 프로모션]\n{title}\n{url}".strip()
                     post_slack(msg)
                     seen_set.add(it["key"])
 
-                state["seen"][site] = sorted(seen_set)
+                state["seen"][site_key] = sorted(seen_set)
                 any_state_changed = True
 
         try:
