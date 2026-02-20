@@ -1,19 +1,4 @@
 # scraper/main.py
-# 신규만 운영채널 알림, debug 신규 생성 시에만 테스트채널 경고
-#
-# 핵심 동작
-# - 운영 채널: "신규 프로모션"만 알림
-# - 테스트 채널: "debug 파일이 새로 생성된 경우에만" 경고 알림
-#
-# 주요 보완(하파크리스틴)
-# - hover 실패는 정상 fallback으로 취급 (debug 생성 X)
-# - 고정 URL(6824/6724) 체크 시:
-#   * HTTP status None은 정상일 수 있으므로 실패로 보지 않음
-#   * status >= 400 또는 페이지 내용이 명백히 에러(404/Not Found 등)일 때만 debug 생성
-#
-# ann365
-# - contact_event 허브 기반
-# - 연속 2페이지 무수집이면 조기 종료하여 실행 시간 단축
 
 import os
 import re
@@ -25,9 +10,6 @@ from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# =========================
-# 환경변수/설정
-# =========================
 SLACK_WEBHOOK_URL_PROD = os.environ.get("SLACK_WEBHOOK_URL_PROD", "").strip()
 SLACK_WEBHOOK_URL_TEST = os.environ.get("SLACK_WEBHOOK_URL_TEST", "").strip()
 
@@ -51,9 +33,6 @@ NAV_TIMEOUT_MS = 45_000
 ACTION_TIMEOUT_MS = 20_000
 
 
-# =========================
-# 공용 유틸
-# =========================
 def _stamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -159,10 +138,6 @@ def _same_host(url_a: str, url_b: str) -> bool:
 
 
 def safe_goto(page, url: str, label: str = "", wait: str = "domcontentloaded"):
-    """
-    페이지 이동 + HTTP status 반환(가능한 경우)
-    - 반환값이 None이면 status를 못 받은 경우(redirect/특수 응답 등)
-    """
     print(f"[goto]{'['+label+']' if label else ''} {url}")
     resp = page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(1000)
@@ -181,7 +156,6 @@ def new_page(browser, *, viewport_w=1200, viewport_h=800):
         timezone_id="Asia/Seoul",
         viewport={"width": viewport_w, "height": viewport_h},
     )
-    # headless 탐지 완화(가벼운 수준)
     context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
     page = context.new_page()
     page.set_default_timeout(ACTION_TIMEOUT_MS)
@@ -209,38 +183,60 @@ def try_close_common_popups(page):
                 pass
 
 
-def page_looks_like_error(page) -> bool:
+def hapakristin_page_seems_ok(page, event_id: int) -> bool:
     """
-    status를 못 받는(None) 케이스가 있어도
-    페이지 자체가 404/Not Found 등 명확한 에러 페이지면 실패로 간주하기 위한 휴리스틱
+    하파크리스틴 이벤트 상세 페이지가 '정상 로딩'인지 휴리스틱 검사.
+    status None 오탐 방지 목적:
+    - 에러 문자열 검사 같은 넓은 조건을 쓰지 않고, 정상 페이지 메타/URL을 확인
     """
-    try:
-        title = (page.title() or "").lower()
-    except Exception:
-        title = ""
-    try:
-        html = (page.content() or "").lower()
-    except Exception:
-        html = ""
+    want = f"/events/{event_id}"
 
-    needles = ["404", "not found", "페이지를 찾을 수", "존재하지", "error", "접근할 수"]
-    if any(n in title for n in needles):
-        return True
-    if any(n in html for n in needles):
-        return True
-    return False
+    ok_count = 0
+
+    try:
+        if want in (page.url or ""):
+            ok_count += 1
+    except Exception:
+        pass
+
+    try:
+        canon = page.locator('link[rel="canonical"]').first.get_attribute("href") or ""
+        if want in canon:
+            ok_count += 1
+    except Exception:
+        pass
+
+    try:
+        ogurl = page.locator('meta[property="og:url"]').first.get_attribute("content") or ""
+        if want in ogurl:
+            ok_count += 1
+    except Exception:
+        pass
+
+    try:
+        ogt = page.locator('meta[property="og:title"]').first.get_attribute("content") or ""
+        if (ogt or "").strip():
+            ok_count += 1
+    except Exception:
+        pass
+
+    try:
+        title = (page.title() or "").strip()
+        if title:
+            ok_count += 1
+    except Exception:
+        pass
+
+    # 3개 중 2개 이상이면 정상으로 간주(너무 빡세지 않게)
+    return ok_count >= 2
 
 
 # =========================
 # 공용 수집기
 # =========================
-def scrape_list_page_anchors(
-    page,
-    list_url: str,
-    include_patterns: list[str],
-    exclude_patterns: list[str] | None = None,
-    max_items: int = DEFAULT_MAX_ITEMS,
-) -> list[dict]:
+def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
+                            exclude_patterns: list[str] | None = None,
+                            max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
     exclude_patterns = exclude_patterns or []
     safe_goto(page, list_url, "list")
     try_close_common_popups(page)
@@ -279,9 +275,8 @@ def scrape_list_page_anchors(
     return results
 
 
-def scrape_main_banners_by_image_links(
-    page, home_url: str, max_items: int = 20, restrict_same_host: bool = True
-) -> list[dict]:
+def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
+                                      restrict_same_host: bool = True) -> list[dict]:
     safe_goto(page, home_url, "home")
     try_close_common_popups(page)
     page.wait_for_timeout(2000)
@@ -330,7 +325,7 @@ def scrape_main_banners_by_image_links(
 
 
 # =========================
-# 사이트별 스크레이퍼
+# 사이트별
 # =========================
 def scrape_olens(page) -> list[dict]:
     url = "https://o-lens.com/event/list"
@@ -377,17 +372,12 @@ def scrape_olens(page) -> list[dict]:
     return _dedup_keep_order(results)
 
 
-# ---- 하파크리스틴 ----
 def _event_id_from_url(u: str) -> int:
     m = re.search(r"/events/(\d+)", u)
     return int(m.group(1)) if m else 0
 
 
 def _hapakristin_try_open_ongoing(page) -> bool:
-    """
-    hover 후 하위 메뉴가 생기는 구조 대응:
-    header/nav 내부에서 '이벤트' 텍스트 후보를 hover → '진행 중인 이벤트' 클릭
-    """
     try:
         candidates = page.locator("header, nav").locator("a, button").filter(has_text=re.compile("이벤트"))
         n = min(candidates.count(), 6)
@@ -413,9 +403,6 @@ def _hapakristin_try_open_ongoing(page) -> bool:
 
 
 def _hapakristin_collect_header_event_ids(page) -> list[str]:
-    """
-    hover로 메뉴가 생성된 경우, header/nav 안의 /events/<id> 링크를 수집
-    """
     hrefs = page.evaluate(
         """() => {
             const roots = Array.from(document.querySelectorAll('header, nav'));
@@ -454,7 +441,6 @@ def scrape_hapakristin(page) -> list[dict]:
     try_close_common_popups(page)
     page.wait_for_timeout(1000)
 
-    # 1) hover 성공 시: header/nav에서 진행중 목록 링크 수집
     if _hapakristin_try_open_ongoing(page):
         event_urls = _hapakristin_collect_header_event_ids(page)
         if event_urls:
@@ -463,31 +449,30 @@ def scrape_hapakristin(page) -> list[dict]:
             print("[hapakristin] events found:", len(results))
             return results
 
-    # 2) hover 실패는 정상 fallback이므로 debug를 만들지 않음
     fixed = [
         "https://hapakristin.co.kr/events/6824",
         "https://hapakristin.co.kr/events/6724",
     ]
 
-    # 고정 URL 자체가 진짜로 깨졌을 때만 debug 생성
     bad = []
     for u in fixed:
-        st = safe_goto(page, u, f"hapakristin_check_{_event_id_from_url(u)}")
+        eid = _event_id_from_url(u)
+        st = safe_goto(page, u, f"hapakristin_check_{eid}")
 
-        # status를 못 받는(None) 케이스는 정상일 수 있으므로 실패로 보지 않음
+        # status가 명확히 4xx/5xx면 실패
         if st is not None and st >= 400:
-            bad.append((u, st))
+            bad.append((u, st, "http_status"))
             continue
 
-        # status가 None이어도, 페이지가 명백히 에러 페이지면 실패로 간주
-        if st is None and page_looks_like_error(page):
-            bad.append((u, "unknown_but_error_page"))
+        # status가 None이어도, 정상 페이지 특징이 안 보이면 실패로 간주
+        if not hapakristin_page_seems_ok(page, eid):
+            bad.append((u, st, "content_check_failed"))
 
     if bad:
         _save_debug(page, "hapakristin_fixed_url_bad")
         _save_debug_text(
             "hapakristin_fixed_url_bad_info",
-            "\n".join([f"{u} status={st}" for u, st in bad]),
+            "\n".join([f"{u} status={st} reason={why}" for u, st, why in bad]),
         )
 
     print("[hapakristin] fallback fixed ids:", [_event_id_from_url(u) for u in fixed])
@@ -496,7 +481,6 @@ def scrape_hapakristin(page) -> list[dict]:
     return results
 
 
-# ---- Lens-me / i-sha / lenbling / yourly / i-dol ----
 def scrape_lensme(page) -> list[dict]:
     return scrape_list_page_anchors(
         page,
@@ -540,7 +524,6 @@ def scrape_i_dol(page) -> list[dict]:
     )
 
 
-# ---- 메인 배너 기반 ----
 def scrape_myfipn(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://www.myfipn.com/")
 
@@ -553,7 +536,6 @@ def scrape_gemhour(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://gemhour.co.kr/")
 
 
-# ---- shop.winc.app ----
 def scrape_shop_winc(page) -> list[dict]:
     home = "https://shop.winc.app/"
     safe_goto(page, home, "winc_home")
@@ -591,7 +573,6 @@ def scrape_shop_winc(page) -> list[dict]:
     return results
 
 
-# ---- ann365 (contact_event 허브) ----
 def _extract_codes_from_strings(strings: list[str]) -> list[str]:
     codes = []
     for s in strings:
@@ -629,7 +610,7 @@ def scrape_ann365(page) -> list[dict]:
 
     results = []
     seen_codes = set()
-    empty_streak = 0  # 연속 무수집 페이지 수
+    empty_streak = 0
 
     for pg in range(1, max_pages + 1):
         list_url = f"{base_list}{pg}"
@@ -699,9 +680,6 @@ def scrape_ann365(page) -> list[dict]:
     return results
 
 
-# =========================
-# 사이트 목록 (표시명 한글)
-# =========================
 SITES = [
     {"site": "O-Lens", "display": "오렌즈", "mode": "normal", "fn": scrape_olens},
     {"site": "Hapa Kristin", "display": "하파크리스틴", "mode": "desktop", "fn": scrape_hapakristin},
@@ -718,9 +696,6 @@ SITES = [
 ]
 
 
-# =========================
-# 메인
-# =========================
 def main():
     state = load_state()
     if "seen" not in state:
@@ -783,7 +758,6 @@ def main():
             debug_after = _list_debug_files()
             new_debug_files = debug_after - debug_before
 
-            # debug 파일이 새로 생성된 경우에만 테스트 채널 경고
             if new_debug_files:
                 run_url = _run_url()
                 picked = _filter_site_debug_files(site_key, new_debug_files)[:8]
@@ -818,7 +792,6 @@ def main():
             new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
             print("[main] new:", len(new_items))
 
-            # 신규 알림은 운영 채널로만
             if new_items:
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
