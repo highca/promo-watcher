@@ -20,6 +20,9 @@ USER_AGENT = (
 DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
+def _stamp() -> str:
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
 def post_slack(text: str):
     resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
     resp.raise_for_status()
@@ -40,20 +43,24 @@ def save_seen(seen: set[str]):
         encoding="utf-8",
     )
 
-def _dedup_keep_order(urls: list[str]) -> list[str]:
+def _dedup_keep_order(items: list[dict]) -> list[dict]:
     out = []
-    s = set()
-    for u in urls:
-        if u not in s:
-            out.append(u)
-            s.add(u)
+    seen = set()
+    for it in items:
+        key = it.get("url") or it.get("title") or it.get("image")
+        if not key:
+            continue
+        if key not in seen:
+            out.append(it)
+            seen.add(key)
     return out
 
-def _stamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-def scrape_event_links(max_retries: int = 2) -> list[str]:
-    print("[scrape] start")
+def scrape_events_click_through(max_items: int = 20, max_retries: int = 2) -> list[dict]:
+    """
+    O-Lens 이벤트 리스트는 <a href>가 아니라 div(role=button) 카드 클릭으로 라우팅됩니다.
+    따라서 카드 클릭 -> /event/view/... 이동한 URL을 수집합니다.
+    (업로드된 HTML에서도 board-information__wrapper 카드 구조가 확인됩니다.)   [oai_citation:1‡olens_list_20260220_015531_attempt1.html](sediment://file_000000002a6872088d5ee46ffcf7a726)
+    """
     last_err = None
 
     for attempt in range(1, max_retries + 1):
@@ -75,91 +82,134 @@ def scrape_event_links(max_retries: int = 2) -> list[str]:
                     user_agent=USER_AGENT,
                     locale="ko-KR",
                     timezone_id="Asia/Seoul",
-                    viewport={"width": 1365, "height": 900},
+                    viewport={"width": 750, "height": 1500},
                 )
                 page = context.new_page()
                 page.set_default_timeout(30000)
 
-                print("[scrape] goto list page (domcontentloaded)")
+                print("[scrape] goto list")
                 resp = page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+                print("[scrape] status:", resp.status if resp else None)
+                print("[scrape] url:", page.url)
 
-                # 진단 로그
-                status = resp.status if resp else None
-                print("[scrape] goto status:", status)
-                print("[scrape] final url:", page.url)
-                print("[scrape] title:", page.title())
-
-                # 네트워크가 계속 도는 SPA를 대비: networkidle은 짧게만 시도
+                # 카드가 나타날 때까지 대기
+                cards = page.locator("div.board-information__wrapper")
                 try:
-                    page.wait_for_load_state("networkidle", timeout=8000)
-                    print("[scrape] networkidle reached")
+                    cards.first.wait_for(timeout=25000)
                 except PlaywrightTimeoutError:
-                    print("[scrape] networkidle timeout (ok)")
+                    # 진단 저장
+                    shot = DEBUG_DIR / f"list_timeout_{stamp}.png"
+                    html = DEBUG_DIR / f"list_timeout_{stamp}.html"
+                    page.screenshot(path=str(shot), full_page=True)
+                    html.write_text(page.content(), encoding="utf-8")
+                    raise RuntimeError("Event cards not found on list page (timeout).")
 
-                # 이벤트 링크가 등장하는지 대기
-                print("[scrape] wait for selector")
+                total = cards.count()
+                print("[scrape] cards:", total)
+                n = min(total, max_items)
+
+                results: list[dict] = []
+
+                for i in range(n):
+                    # 리스트 화면에서 카드 정보(제목/구분/이미지) 먼저 추출
+                    card = cards.nth(i)
+
+                    chip = ""
+                    title = ""
+                    image = ""
+
+                    try:
+                        chip = (card.locator(".board-information__chip .v-chip__content").first.inner_text() or "").strip()
+                    except Exception:
+                        chip = ""
+
+                    try:
+                        title = (card.locator(".board-information__title").first.inner_text() or "").strip()
+                    except Exception:
+                        title = ""
+
+                    try:
+                        image = card.locator("img.board-information__image").first.get_attribute("src") or ""
+                    except Exception:
+                        image = ""
+
+                    print(f"[scrape] #{i+1}/{n} title:", title)
+
+                    # 클릭 -> 상세로 이동 -> URL 수집
+                    url = ""
+                    try:
+                        card.click(timeout=10000)
+                        page.wait_for_url(re.compile(r".*/event/view/.*"), timeout=25000)
+                        url = page.url
+                    except PlaywrightTimeoutError:
+                        # 클릭했는데 상세로 안 가는 경우(라우팅 실패/차단) 진단 저장 후 다음 카드로
+                        fail_shot = DEBUG_DIR / f"detail_timeout_{stamp}_idx{i+1}.png"
+                        page.screenshot(path=str(fail_shot), full_page=True)
+                        print(f"[scrape] detail timeout on idx {i+1}, continue")
+                    finally:
+                        # 다시 리스트로 복귀 (url이 상세로 바뀌었으면 뒤로가기)
+                        if "/event/view/" in page.url:
+                            try:
+                                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                                # 리스트 카드 다시 로드 확인
+                                page.locator("div.board-information__wrapper").first.wait_for(timeout=20000)
+                                cards = page.locator("div.board-information__wrapper")
+                            except Exception:
+                                # 복귀 실패 시 리스트 재접속
+                                page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+                                page.locator("div.board-information__wrapper").first.wait_for(timeout=25000)
+                                cards = page.locator("div.board-information__wrapper")
+
+                    if url:
+                        results.append(
+                            {
+                                "url": url,
+                                "title": title,
+                                "chip": chip,
+                                "image": image,
+                            }
+                        )
+
+                # 진단용: 리스트 화면 스냅샷 1장 저장
                 try:
-                    page.wait_for_selector('a[href*="/event/view/"]', timeout=20000)
-                    print("[scrape] selector appeared")
-                except PlaywrightTimeoutError:
-                    print("[scrape] selector wait timeout - save debug files")
-
-                # 진단 파일 저장: 스크린샷 + HTML
-                shot_path = DEBUG_DIR / f"olens_list_{stamp}_attempt{attempt}.png"
-                html_path = DEBUG_DIR / f"olens_list_{stamp}_attempt{attempt}.html"
-                try:
-                    page.screenshot(path=str(shot_path), full_page=True)
-                    html = page.content()
-                    html_path.write_text(html, encoding="utf-8")
-                    print("[scrape] saved:", str(shot_path), str(html_path))
-                except Exception as e:
-                    print("[scrape] debug save failed:", repr(e))
-
-                # 링크 수집 (셀렉터를 넓게 시도)
-                print("[scrape] collect anchors")
-                anchors = page.locator('a[href*="/event/"]').all()
-                print("[scrape] anchors(total /event/):", len(anchors))
-
-                links: list[str] = []
-                for a in anchors:
-                    href = a.get_attribute("href") or ""
-                    if not href:
-                        continue
-                    if href.startswith("/"):
-                        href = "https://o-lens.com" + href
-                    if re.search(r"/event/view/\d+", href):
-                        links.append(href)
-
-                links = _dedup_keep_order(links)
-                print("[scrape] links(found view/*):", len(links))
+                    list_shot = DEBUG_DIR / f"olens_list_{stamp}.png"
+                    page.screenshot(path=str(list_shot), full_page=True)
+                    print("[scrape] saved list screenshot:", str(list_shot))
+                except Exception:
+                    pass
 
                 context.close()
                 browser.close()
 
-                return links
+                results = _dedup_keep_order(results)
+                print("[scrape] results:", len(results))
+                return results
 
         except Exception as e:
             last_err = e
-            print(f"[scrape] error on attempt {attempt}: {repr(e)}")
+            print("[scrape] error:", repr(e))
             time.sleep(2 * attempt)
 
-    raise RuntimeError(f"Failed to scrape after {max_retries} attempts: {repr(last_err)}")
+    raise RuntimeError(f"Failed to scrape after retries: {repr(last_err)}")
 
 def main():
     print("[main] start")
     seen = load_seen()
     print("[main] seen:", len(seen))
 
-    links = scrape_event_links(max_retries=2)
-    print("[main] links:", len(links))
+    events = scrape_events_click_through(max_items=20, max_retries=2)
+    print("[main] events:", len(events))
 
-    new_links = [u for u in links if u not in seen]
-    print("[main] new_links:", len(new_links))
+    new_events = [e for e in events if e.get("url") and e["url"] not in seen]
+    print("[main] new_events:", len(new_events))
 
-    if new_links:
-        for url in new_links[:10]:
-            post_slack(f"[O-Lens 신규 이벤트] {url}")
-            seen.add(url)
+    if new_events:
+        for e in new_events[:10]:
+            msg = f"[O-Lens 신규 이벤트] {e.get('title','').strip()}\n{e['url']}"
+            # 원하시면 이미지도 같이 보고 싶을 때는 아래 1줄을 추가로 붙이셔도 됩니다.
+            # if e.get("image"): msg += f"\n{e['image']}"
+            post_slack(msg)
+            seen.add(e["url"])
         save_seen(seen)
         print("[main] state saved")
     else:
