@@ -6,6 +6,7 @@ import requests
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
@@ -19,11 +20,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# 첫 도입 시 기존 이벤트/배너가 한꺼번에 알림 되는 것을 막고 싶으면 True 권장
 INIT_SILENT = True
 
-# 각 사이트에서 “너무 많이” 긁어오는 걸 방지하기 위한 상한
 DEFAULT_MAX_ITEMS = 30
+SITE_TIMEOUT_SEC = 35   # 사이트 하나당 최대 처리 시간(초)
 
 
 def _stamp() -> str:
@@ -103,23 +103,20 @@ def _same_host(url_a: str, url_b: str) -> bool:
 
 
 # -----------------------------
-# 범용 스크레이퍼(보드/메뉴/배너)
+# 공용 함수
 # -----------------------------
 
-def scrape_list_page_anchors(
-    page,
-    list_url: str,
-    include_patterns: list[str],
-    exclude_patterns: list[str] | None = None,
-    max_items: int = DEFAULT_MAX_ITEMS,
-) -> list[dict]:
-    """
-    서버/SPA 무관하게, 목록 페이지에서 a[href]를 수집하여 include_patterns에 맞는 링크를 반환합니다.
-    """
+def safe_goto(page, url: str, label: str = ""):
+    print(f"[goto]{'['+label+']' if label else ''} {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(1200)
+
+
+def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
+                            exclude_patterns: list[str] | None = None,
+                            max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
     exclude_patterns = exclude_patterns or []
-    print("[list] goto", list_url)
-    page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2000)
+    safe_goto(page, list_url, "list")
 
     anchors = page.locator("a[href]").all()
     base = page.url
@@ -131,16 +128,13 @@ def scrape_list_page_anchors(
         if not url:
             continue
 
-        # include
         if include_patterns and not any(re.search(p, url) for p in include_patterns):
             continue
-        # exclude
         if exclude_patterns and any(re.search(p, url) for p in exclude_patterns):
             continue
 
         title = (a.inner_text() or "").strip()
         if not title:
-            # 이미지 링크일 수 있어 alt로 보강
             try:
                 img = a.locator("img").first
                 title = (img.get_attribute("alt") or "").strip()
@@ -158,23 +152,11 @@ def scrape_list_page_anchors(
     return results
 
 
-def scrape_gnb_click_then_collect(
-    page,
-    home_url: str,
-    menu_text: str,
-    include_patterns: list[str],
-    max_items: int = DEFAULT_MAX_ITEMS,
-) -> tuple[str, list[dict]]:
-    """
-    홈으로 간 뒤, GNB(또는 어딘가)의 menu_text를 포함한 a/button을 클릭해서 페이지 이동 후,
-    그 페이지에서 include_patterns 링크를 수집합니다.
-    반환: (이동한 url, 수집 결과)
-    """
-    print("[gnb] goto", home_url)
-    page.goto(home_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(1500)
+def scrape_gnb_click_then_collect(page, home_url: str, menu_text: str,
+                                 include_patterns: list[str],
+                                 max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
+    safe_goto(page, home_url, "home")
 
-    # 클릭 후보(사이트마다 메뉴 태그가 다름)
     candidates = [
         f'a:has-text("{menu_text}")',
         f'button:has-text("{menu_text}")',
@@ -188,51 +170,38 @@ def scrape_gnb_click_then_collect(
         if loc.count() > 0:
             try:
                 before = page.url
+                print("[gnb] click", menu_text, "via", sel)
                 loc.first.click(timeout=8000)
                 clicked = True
-                # 라우팅/로드 대기
+                page.wait_for_timeout(800)
                 try:
-                    page.wait_for_timeout(800)
                     page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except Exception:
                     pass
-                # URL이 안 바뀌는 SPA도 있어 추가 대기
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(1500)
                 after = page.url
-                print("[gnb] clicked menu, url:", before, "->", after)
+                print("[gnb] url:", before, "->", after)
                 break
             except Exception:
                 pass
 
     if not clicked:
         _save_debug(page, f"gnb_click_fail_{menu_text}")
-        return (page.url, [])
+        return []
 
-    # 이동한 페이지에서 링크 수집
-    moved_url = page.url
-    results = scrape_list_page_anchors(
+    return scrape_list_page_anchors(
         page,
-        moved_url,
+        list_url=page.url,
         include_patterns=include_patterns,
         exclude_patterns=[],
         max_items=max_items,
     )
-    return (moved_url, results)
 
 
-def scrape_main_banners_by_image_links(
-    page,
-    home_url: str,
-    max_items: int = 20,
-    restrict_same_host: bool = True,
-) -> list[dict]:
-    """
-    메인 배너는 대개 이미지가 포함된 링크로 구성됩니다.
-    a:has(img)를 폭넓게 수집한 뒤, 중복 제거로 관리합니다.
-    """
-    print("[banner] goto", home_url)
-    page.goto(home_url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(4000)
+def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
+                                      restrict_same_host: bool = True) -> list[dict]:
+    safe_goto(page, home_url, "home")
+    page.wait_for_timeout(2500)
 
     base = page.url
     selectors = [
@@ -267,7 +236,6 @@ def scrape_main_banners_by_image_links(
 
             results.append({"key": url, "url": url, "title": title})
             seen.add(url)
-
             if len(results) >= max_items:
                 break
         if len(results) >= max_items:
@@ -285,12 +253,8 @@ def scrape_main_banners_by_image_links(
 # -----------------------------
 
 def scrape_olens(page) -> list[dict]:
-    """
-    O-Lens: 카드 클릭형(기존 동작 유지)
-    """
     EVENT_LIST_URL = "https://o-lens.com/event/list"
-    print("[olens] goto", EVENT_LIST_URL)
-    page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+    safe_goto(page, EVENT_LIST_URL, "olens")
 
     cards = page.locator("div.board-information__wrapper")
     try:
@@ -300,7 +264,7 @@ def scrape_olens(page) -> list[dict]:
         return []
 
     total = cards.count()
-    n = min(total, 20)
+    n = min(total, 15)
     print("[olens] cards:", total, "use:", n)
 
     results = []
@@ -326,7 +290,7 @@ def scrape_olens(page) -> list[dict]:
                     page.locator("div.board-information__wrapper").first.wait_for(timeout=20000)
                     cards = page.locator("div.board-information__wrapper")
                 except Exception:
-                    page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+                    safe_goto(page, EVENT_LIST_URL, "olens_back")
                     page.locator("div.board-information__wrapper").first.wait_for(timeout=25000)
                     cards = page.locator("div.board-information__wrapper")
 
@@ -336,34 +300,106 @@ def scrape_olens(page) -> list[dict]:
     return _dedup_keep_order(results)
 
 
+def scrape_hapakristin(page) -> list[dict]:
+    return scrape_gnb_click_then_collect(
+        page,
+        home_url="https://hapakristin.co.kr/",
+        menu_text="진행 중인 이벤트",
+        include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products)/"],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+
+
 def scrape_lensme(page) -> list[dict]:
-    """
-    Lens-me: 이벤트 보드
-    """
-    url = "https://www.lens-me.com/shop/board.php?ps_bbscuid=17"
     return scrape_list_page_anchors(
         page,
-        list_url=url,
+        list_url="https://www.lens-me.com/shop/board.php?ps_bbscuid=17",
         include_patterns=[r"ps_mode=view", r"ps_uid=\d+"],
         exclude_patterns=[],
         max_items=DEFAULT_MAX_ITEMS,
     )
 
 
-def scrape_hapakristin(page) -> list[dict]:
-    """
-    Hapa Kristin: GNB의 '진행 중인 이벤트' 하위에 프로모션 추가 구조
-    - 메뉴 클릭 후, collections/pages/products 링크를 수집
-    """
-    home = "https://hapakristin.co.kr/"
-    _, results = scrape_gnb_click_then_collect(
+def scrape_i_sha(page) -> list[dict]:
+    return scrape_list_page_anchors(
         page,
-        home_url=home,
-        menu_text="진행 중인 이벤트",
-        include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products)/"],
+        list_url="https://i-sha.kr/board/%EC%9D%B4%EB%B2%A4%ED%8A%B8/8/",
+        include_patterns=[r"i-sha\.kr/board/"],
+        exclude_patterns=[r"/page/\d+/?$"],
         max_items=DEFAULT_MAX_ITEMS,
     )
+
+
+def scrape_lenbling(page) -> list[dict]:
+    return scrape_list_page_anchors(
+        page,
+        list_url="https://lenbling.com/board/event/8/",
+        include_patterns=[r"lenbling\.com/board/event/"],
+        exclude_patterns=[r"/board/event/8/?$"],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+
+
+def scrape_yourly(page) -> list[dict]:
+    return scrape_list_page_anchors(
+        page,
+        list_url="https://yourly.kr/board/event",
+        include_patterns=[r"yourly\.kr/board/event"],
+        exclude_patterns=[r"/board/event/?$"],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+
+
+def scrape_i_dol(page) -> list[dict]:
+    return scrape_list_page_anchors(
+        page,
+        list_url="https://www.i-dol.kr/bbs/event1.php",
+        include_patterns=[r"i-dol\.kr/bbs/"],
+        exclude_patterns=[r"event1\.php$"],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+
+
+def scrape_shop_winc(page) -> list[dict]:
+    results = scrape_gnb_click_then_collect(
+        page,
+        home_url="https://shop.winc.app/",
+        menu_text="이벤트",
+        include_patterns=[r"shop\.winc\.app/.*(event|promotion|board|bbs)"],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+    if not results:
+        results = [{"key": page.url, "url": page.url, "title": "이벤트(메뉴 이동)"}]
     return results
+
+
+def scrape_ann365(page) -> list[dict]:
+    safe_goto(page, "https://ann365.com/sub/menu.php", "ann365")
+
+    # SALE 클릭 시도
+    clicked_sale = False
+    for sel in ['a:has-text("SALE")', 'button:has-text("SALE")', 'div:has-text("SALE")']:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                print("[ann365] click SALE via", sel)
+                loc.first.click(timeout=8000)
+                clicked_sale = True
+                page.wait_for_timeout(2000)
+                break
+            except Exception:
+                pass
+
+    if not clicked_sale:
+        print("[ann365] SALE click failed (continue)")
+
+    return scrape_list_page_anchors(
+        page,
+        list_url=page.url,
+        include_patterns=[r"ann365\.com/.*(event|이벤트|menu\.php)"],
+        exclude_patterns=[],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
 
 
 def scrape_myfipn(page) -> list[dict]:
@@ -378,152 +414,47 @@ def scrape_gemhour(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://gemhour.co.kr/", max_items=20, restrict_same_host=True)
 
 
-def scrape_i_sha(page) -> list[dict]:
-    """
-    i-sha: 이벤트 보드(워드프레스/게시판 형태)
-    """
-    url = "https://i-sha.kr/board/%EC%9D%B4%EB%B2%A4%ED%8A%B8/8/"
-    # 보통 /?p=, /board/이벤트/, /event/ 등으로 상세가 열림. 우선 'board' 하위 링크를 넓게 수집
-    return scrape_list_page_anchors(
-        page,
-        list_url=url,
-        include_patterns=[r"i-sha\.kr/board/"],
-        exclude_patterns=[r"/page/\d+/?$"],  # 페이징 제외
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
-def scrape_lenbling(page) -> list[dict]:
-    """
-    lenbling: /board/event/8/ 목록 + 하위 상세
-    """
-    url = "https://lenbling.com/board/event/8/"
-    return scrape_list_page_anchors(
-        page,
-        list_url=url,
-        include_patterns=[r"lenbling\.com/board/event/"],
-        exclude_patterns=[r"/board/event/8/?$"],  # 자기 자신 제외
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
-def scrape_yourly(page) -> list[dict]:
-    """
-    yourly: /board/event 목록 + 하위 상세
-    """
-    url = "https://yourly.kr/board/event"
-    return scrape_list_page_anchors(
-        page,
-        list_url=url,
-        include_patterns=[r"yourly\.kr/board/event"],
-        exclude_patterns=[r"/board/event/?$"],  # 목록 자신 제외
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
-def scrape_i_dol(page) -> list[dict]:
-    """
-    i-dol: 이벤트 페이지 존재
-    """
-    url = "https://www.i-dol.kr/bbs/event1.php"
-    return scrape_list_page_anchors(
-        page,
-        list_url=url,
-        include_patterns=[r"i-dol\.kr/bbs/"],
-        exclude_patterns=[r"event1\.php$"],  # 목록 자신 제외(상세가 같은 파일일 수도 있어, 필요 시 제거)
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
-def scrape_shop_winc(page) -> list[dict]:
-    """
-    shop.winc.app: URL을 모르지만 GNB에 '이벤트' 메뉴가 항상 있음
-    - 홈에서 '이벤트' 클릭 후, 이동한 페이지에서 이벤트/프로모션 후보 링크 수집
-    """
-    home = "https://shop.winc.app/"
-    moved_url, results = scrape_gnb_click_then_collect(
-        page,
-        home_url=home,
-        menu_text="이벤트",
-        include_patterns=[
-            r"shop\.winc\.app/.*event",
-            r"shop\.winc\.app/.*promotion",
-            r"shop\.winc\.app/board",
-            r"shop\.winc\.app/bbs",
-        ],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-    # moved_url 자체가 이벤트 허브면, 그 페이지 URL을 key로 저장하는 것도 방법
-    # (이벤트 목록 구조가 링크를 거의 안 주는 경우 대비)
-    if not results:
-        results = [{"key": moved_url, "url": moved_url, "title": "이벤트 페이지(메뉴 이동)"}]
-
-    return results
-
-
-def scrape_ann365(page) -> list[dict]:
-    """
-    ann365: SALE 하위에 이벤트 링크가 생김
-    - 홈(또는 메뉴 페이지)에서 'SALE' 클릭 -> 그 안에서 '이벤트' 혹은 event 포함 링크 수집
-    """
-    base = "https://ann365.com/sub/menu.php"
-    print("[ann365] goto", base)
-    page.goto(base, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(1500)
-
-    # 1) SALE 클릭(가능하면)
-    clicked_sale = False
-    for sel in [f'a:has-text("SALE")', f'button:has-text("SALE")', f'div:has-text("SALE")']:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                loc.first.click(timeout=8000)
-                clicked_sale = True
-                page.wait_for_timeout(2000)
-                break
-            except Exception:
-                pass
-
-    if not clicked_sale:
-        # SALE 클릭이 실패해도 현재 페이지 내 링크에서 'event'를 찾아본다
-        print("[ann365] SALE click failed (continue)")
-
-    # 2) SALE 하위에서 이벤트 링크 수집
-    # ann365는 메뉴 구조상 /sub/menu.php?menu=... 처럼 뜰 가능성이 높아 넓게 잡는다
-    return scrape_list_page_anchors(
-        page,
-        list_url=page.url,
-        include_patterns=[r"ann365\.com/.*(event|이벤트|menu\.php)"],
-        exclude_patterns=[],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
 # -----------------------------
-# 러너
+# Runner (사이트별 타임아웃)
 # -----------------------------
 
 SITES = [
     {"site": "O-Lens", "fn": scrape_olens},
     {"site": "Hapa Kristin", "fn": scrape_hapakristin},
     {"site": "Lens-me", "fn": scrape_lensme},
-    {"site": "MYFiPN", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "fn": scrape_chuulens},
-    {"site": "Gemhour", "fn": scrape_gemhour},
     {"site": "i-sha", "fn": scrape_i_sha},
     {"site": "shop.winc.app", "fn": scrape_shop_winc},
     {"site": "ann365", "fn": scrape_ann365},
     {"site": "lenbling", "fn": scrape_lenbling},
     {"site": "yourly", "fn": scrape_yourly},
     {"site": "i-dol", "fn": scrape_i_dol},
+    {"site": "MYFiPN", "fn": scrape_myfipn},
+    {"site": "CHUU Lens", "fn": scrape_chuulens},
+    {"site": "Gemhour", "fn": scrape_gemhour},
 ]
+
+def run_one_site_with_timeout(browser, site: str, fn):
+    """
+    각 사이트를 별도 스레드로 실행 + 타임아웃으로 강제 스킵
+    """
+    ctx = _new_context(browser)
+    page = ctx.new_page()
+    page.set_default_timeout(30000)
+
+    try:
+        return fn(page) or []
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 def main():
     state = load_state()
     if "seen" not in state:
         state["seen"] = {}
 
+    print("[main] sites:", len(SITES))
     print("[main] loaded state sites:", list(state["seen"].keys()))
 
     with sync_playwright() as p:
@@ -542,29 +473,30 @@ def main():
             site = site_cfg["site"]
             fn = site_cfg["fn"]
 
-            print("\n[main] site:", site)
-            context = _new_context(browser)
-            page = context.new_page()
-            page.set_default_timeout(30000)
+            print("\n[main] site start:", site)
 
+            items = []
+            start = time.time()
+
+            # 사이트별 하드 타임아웃
             try:
-                items = fn(page) or []
-            except Exception as e:
-                print("[main] error in site:", site, repr(e))
-                _save_debug(page, f"error_{site.replace(' ', '_')}")
+                with ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(run_one_site_with_timeout, browser, site, fn)
+                    items = fut.result(timeout=SITE_TIMEOUT_SEC)
+            except FutureTimeoutError:
+                print(f"[main] site timeout({SITE_TIMEOUT_SEC}s):", site)
+                # 타임아웃 시에도 다음으로 진행
                 items = []
-            finally:
-                try:
-                    context.close()
-                except Exception:
-                    pass
+            except Exception as e:
+                print("[main] site error:", site, repr(e))
+                items = []
 
+            elapsed = time.time() - start
             items = _dedup_keep_order(items)
-            print("[main] scraped:", len(items))
+            print("[main] site done:", site, "scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
             seen_set = set(state["seen"].get(site, []))
 
-            # 첫 도입 시 조용히 초기화(알림 안 보내고 state만 채움)
             if INIT_SILENT and not seen_set and items:
                 for it in items:
                     k = it.get("key")
