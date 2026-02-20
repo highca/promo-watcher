@@ -316,11 +316,72 @@ def scrape_olens(page) -> list[dict]:
 
 
 def scrape_hapakristin(page) -> list[dict]:
-    return scrape_gnb_click_then_collect(
+    home = "https://hapakristin.co.kr/"
+    safe_goto(page, home, "hapakristin_home")
+
+    # 1) 상위 메뉴(이벤트/프로모션 등)를 hover해서 드롭다운을 띄움
+    parent_candidates = [
+        'nav a:has-text("이벤트")',
+        'header a:has-text("이벤트")',
+        'a:has-text("이벤트")',
+        'nav a:has-text("EVENT")',
+        'header a:has-text("EVENT")',
+        'a:has-text("EVENT")',
+    ]
+
+    hovered = False
+    for sel in parent_candidates:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                loc.first.hover(timeout=8_000)
+                page.wait_for_timeout(700)
+                hovered = True
+                break
+            except Exception:
+                pass
+
+    if not hovered:
+        _save_debug(page, "hapakristin_hover_fail")
+        return []
+
+    # 2) hover로 생성된 하위 메뉴 중 "진행 중인 이벤트" 클릭
+    submenu_candidates = [
+        'a:has-text("진행 중인 이벤트")',
+        'a:has-text("진행중인 이벤트")',
+        'a:has-text("진행 이벤트")',
+    ]
+
+    clicked = False
+    for sel in submenu_candidates:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                before = page.url
+                loc.first.click(timeout=8_000)
+                page.wait_for_timeout(800)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:
+                    pass
+                after = page.url
+                print("[hapakristin] submenu click url:", before, "->", after)
+                clicked = True
+                break
+            except Exception:
+                pass
+
+    if not clicked:
+        _save_debug(page, "hapakristin_submenu_click_fail")
+        return []
+
+    # 3) 도착한 페이지에서 이벤트/프로모션 링크 수집
+    # (사이트 구조상 /events/XXXX 또는 상품/컬렉션으로 연결될 수 있어 범위를 넓게 잡음)
+    return scrape_list_page_anchors(
         page,
-        home_url="https://hapakristin.co.kr/",
-        menu_text="진행 중인 이벤트",
+        list_url=page.url,
         include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
+        exclude_patterns=[],
         max_items=DEFAULT_MAX_ITEMS,
     )
 
@@ -446,8 +507,8 @@ def scrape_shop_winc(page) -> list[dict]:
 
 # -----------------------------
 # Slack 표시명(display) 한글화
-# site: state 저장용 키 (기존 값 유지)
-# display: Slack 표시용 이름 (한글)
+# site: state 저장용 키(기존 유지)
+# display: Slack 표시용 이름(한글)
 # -----------------------------
 
 SITES = [
@@ -485,8 +546,8 @@ def main():
         )
 
         for cfg in SITES:
-            site_key = cfg["site"]                   # state 저장 키
-            site_name = cfg.get("display", site_key) # Slack 표시명(한글)
+            site_key = cfg["site"]
+            site_name = cfg.get("display", site_key)
             fn = cfg["fn"]
 
             print("\n[main] site:", site_key, "(", site_name, ")")
