@@ -355,41 +355,68 @@ def scrape_hapakristin(page) -> list[dict]:
     try_close_common_popups(page)
     page.wait_for_timeout(2000)
 
-    event_url = _hapakristin_find_event_list_url_from_home(page)
-    if event_url:
-        print("[hapakristin] found event url:", event_url)
-        return scrape_list_page_anchors(
-            page,
-            list_url=event_url,
-            include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
-            exclude_patterns=[],
-            max_items=DEFAULT_MAX_ITEMS,
-        )
+    # 1) 홈에서 /events/<id> 링크만 수집
+    base = page.url
+    anchors = page.locator("a[href]").all()
 
-    guesses = [
-        "https://hapakristin.co.kr/events",
-        "https://hapakristin.co.kr/pages/event",
-    ]
+    event_urls = []
+    for a in anchors:
+        href = a.get_attribute("href") or ""
+        url = _abs_url(base, href)
+        if not url:
+            continue
+        if not _same_host(base, url):
+            continue
 
-    for g in guesses:
-        try:
-            safe_goto(page, g, "hapakristin_guess")
-            try_close_common_popups(page)
-            page.wait_for_timeout(1500)
-            items = scrape_list_page_anchors(
-                page,
-                list_url=page.url,
-                include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
-                exclude_patterns=[],
-                max_items=DEFAULT_MAX_ITEMS,
-            )
-            if items:
-                return items
-        except Exception:
-            pass
+        if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", url):
+            event_urls.append(url.rstrip("/"))
 
-    _save_debug(page, "hapakristin_event_discovery_fail")
-    return []
+    # 2) 홈에서 못 찾으면, 알려진 이벤트 허브로 한 번 더 시도(구조 변경 대비)
+    #    (현재 사용자가 주신 6824 같은 페이지가 허브 역할일 가능성이 높음)
+    if not event_urls:
+        fallback_list_pages = [
+            "https://hapakristin.co.kr/events/6824",
+            "https://hapakristin.co.kr/events/6724",
+            "https://hapakristin.co.kr/events",
+        ]
+        for list_url in fallback_list_pages:
+            try:
+                safe_goto(page, list_url, "hapakristin_events_fallback")
+                try_close_common_popups(page)
+                page.wait_for_timeout(1500)
+
+                anchors2 = page.locator("a[href]").all()
+                for a in anchors2:
+                    href = a.get_attribute("href") or ""
+                    url = _abs_url(page.url, href)
+                    if not url:
+                        continue
+                    if not _same_host(page.url, url):
+                        continue
+                    if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", url):
+                        event_urls.append(url.rstrip("/"))
+
+                if event_urls:
+                    break
+            except Exception:
+                pass
+
+    # 3) 정리 + 최대 개수 제한(너무 많이 쌓일 때 대비)
+    event_urls = list(dict.fromkeys(event_urls))
+
+    # (선택) 이벤트 id 큰 순으로 정렬: /events/6824 -> 6824
+    def _event_id(u: str) -> int:
+        m = re.search(r"/events/(\d+)", u)
+        return int(m.group(1)) if m else 0
+
+    event_urls.sort(key=_event_id, reverse=True)
+
+    results = [{"key": u, "url": u, "title": f"이벤트 {_event_id(u)}"} for u in event_urls[:20]]
+
+    print("[hapakristin] events found:", len(results))
+    if not results:
+        _save_debug(page, "hapakristin_events_no_results")
+    return results
 
 
 def scrape_lensme(page) -> list[dict]:
