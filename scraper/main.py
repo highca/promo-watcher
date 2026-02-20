@@ -1,46 +1,79 @@
-name: O-Lens Event Monitor
+import os
+import re
+import json
+import requests
+from pathlib import Path
+from playwright.sync_api import sync_playwright
 
-on:
-  schedule:
-    - cron: "*/15 * * * *"   # 15분마다 (UTC 기준)
-  workflow_dispatch:
+EVENT_LIST_URL = "https://o-lens.com/event/list"
+STATE_PATH = Path("state/olens_seen.json")
 
-permissions:
-  contents: write   # state 파일 자동 커밋을 위해 필요
+SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+def post_slack(text: str):
+    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    resp.raise_for_status()
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+def load_seen() -> set[str]:
+    if not STATE_PATH.exists():
+        return set()
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return set(data if isinstance(data, list) else [])
+    except Exception:
+        return set()
 
-      - name: Install Python deps
-        run: |
-          pip install -U pip
-          pip install playwright requests
+def save_seen(seen: set[str]):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(
+        json.dumps(sorted(seen), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-      - name: Install Chromium for Playwright
-        run: |
-          python -m playwright install --with-deps chromium
+def scrape_event_links() -> list[str]:
+    links: list[str] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(EVENT_LIST_URL, wait_until="networkidle", timeout=60000)
 
-      - name: Run scraper
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python scraper/main.py
+        anchors = page.locator('a[href*="/event/view/"]').all()
+        for a in anchors:
+            href = a.get_attribute("href") or ""
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = "https://o-lens.com" + href
 
-      - name: Commit state if changed
-        run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "Update olens state"
-            git push
-          fi
+            if re.search(r"/event/view/\d+", href):
+                links.append(href)
+
+        browser.close()
+
+    # 중복 제거(순서 유지)
+    dedup = []
+    s = set()
+    for u in links:
+        if u not in s:
+            dedup.append(u)
+            s.add(u)
+    return dedup
+
+def main():
+    seen = load_seen()
+    links = scrape_event_links()
+
+    new_links = [u for u in links if u not in seen]
+
+    # 첫 실행 도배 방지(원하시면 활성화)
+    # if not seen and links:
+    #     new_links = []
+
+    if new_links:
+        for url in new_links[:10]:
+            post_slack(f"[O-Lens 신규 이벤트] {url}")
+            seen.add(url)
+        save_seen(seen)
+
+if __name__ == "__main__":
+    main()
