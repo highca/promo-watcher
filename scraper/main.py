@@ -4,19 +4,21 @@ import json
 import time
 import requests
 from pathlib import Path
+from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 EVENT_LIST_URL = "https://o-lens.com/event/list"
 STATE_PATH = Path("state/olens_seen.json")
 
-# GitHub Actions Secrets에서 주입
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
-# Headless 차단/렌더링 이슈 완화를 위한 UA
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+
+DEBUG_DIR = Path("debug")
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 def post_slack(text: str):
     resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
@@ -47,39 +49,76 @@ def _dedup_keep_order(urls: list[str]) -> list[str]:
             s.add(u)
     return out
 
+def _stamp() -> str:
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
 def scrape_event_links(max_retries: int = 2) -> list[str]:
-    """
-    O-Lens 이벤트 목록 페이지는 SPA/JS 렌더링 기반이라 networkidle 대기가 무한정 늘어질 수 있습니다.
-    따라서 domcontentloaded로 빠르게 로딩 후, selector 등장/대기 방식으로 안정화합니다.
-    """
     print("[scrape] start")
     last_err = None
 
     for attempt in range(1, max_retries + 1):
+        stamp = _stamp()
         print(f"[scrape] attempt {attempt}/{max_retries}")
+
         try:
             with sync_playwright() as p:
-                print("[scrape] launching browser")
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
 
-                page = browser.new_page(user_agent=USER_AGENT)
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="ko-KR",
+                    timezone_id="Asia/Seoul",
+                    viewport={"width": 1365, "height": 900},
+                )
+                page = context.new_page()
                 page.set_default_timeout(30000)
 
                 print("[scrape] goto list page (domcontentloaded)")
-                page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+                resp = page.goto(EVENT_LIST_URL, wait_until="domcontentloaded", timeout=60000)
 
-                # JS 렌더링 대기 (너무 길게 잡지 않음)
-                print("[scrape] wait for render")
+                # 진단 로그
+                status = resp.status if resp else None
+                print("[scrape] goto status:", status)
+                print("[scrape] final url:", page.url)
+                print("[scrape] title:", page.title())
+
+                # 네트워크가 계속 도는 SPA를 대비: networkidle은 짧게만 시도
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                    print("[scrape] networkidle reached")
+                except PlaywrightTimeoutError:
+                    print("[scrape] networkidle timeout (ok)")
+
+                # 이벤트 링크가 등장하는지 대기
+                print("[scrape] wait for selector")
                 try:
                     page.wait_for_selector('a[href*="/event/view/"]', timeout=20000)
+                    print("[scrape] selector appeared")
                 except PlaywrightTimeoutError:
-                    # selector가 늦게 뜨거나 아예 안 뜰 수 있어 fallback
-                    print("[scrape] selector wait timeout - fallback to fixed sleep")
-                    page.wait_for_timeout(6000)
+                    print("[scrape] selector wait timeout - save debug files")
 
+                # 진단 파일 저장: 스크린샷 + HTML
+                shot_path = DEBUG_DIR / f"olens_list_{stamp}_attempt{attempt}.png"
+                html_path = DEBUG_DIR / f"olens_list_{stamp}_attempt{attempt}.html"
+                try:
+                    page.screenshot(path=str(shot_path), full_page=True)
+                    html = page.content()
+                    html_path.write_text(html, encoding="utf-8")
+                    print("[scrape] saved:", str(shot_path), str(html_path))
+                except Exception as e:
+                    print("[scrape] debug save failed:", repr(e))
+
+                # 링크 수집 (셀렉터를 넓게 시도)
                 print("[scrape] collect anchors")
-                anchors = page.locator('a[href*="/event/view/"]').all()
-                print("[scrape] anchors:", len(anchors))
+                anchors = page.locator('a[href*="/event/"]').all()
+                print("[scrape] anchors(total /event/):", len(anchors))
 
                 links: list[str] = []
                 for a in anchors:
@@ -91,20 +130,19 @@ def scrape_event_links(max_retries: int = 2) -> list[str]:
                     if re.search(r"/event/view/\d+", href):
                         links.append(href)
 
-                print("[scrape] closing browser")
+                links = _dedup_keep_order(links)
+                print("[scrape] links(found view/*):", len(links))
+
+                context.close()
                 browser.close()
 
-                links = _dedup_keep_order(links)
-                print("[scrape] done, links:", len(links))
                 return links
 
         except Exception as e:
             last_err = e
             print(f"[scrape] error on attempt {attempt}: {repr(e)}")
-            # 짧은 backoff
             time.sleep(2 * attempt)
 
-    # 재시도 후에도 실패하면 예외로 처리(워크플로 빨간불로 원인 추적)
     raise RuntimeError(f"Failed to scrape after {max_retries} attempts: {repr(last_err)}")
 
 def main():
@@ -118,7 +156,6 @@ def main():
     new_links = [u for u in links if u not in seen]
     print("[main] new_links:", len(new_links))
 
-    # 신규가 있을 때만 Slack 전송
     if new_links:
         for url in new_links[:10]:
             post_slack(f"[O-Lens 신규 이벤트] {url}")
