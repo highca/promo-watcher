@@ -1,4 +1,4 @@
-name: O-Lens Event Monitor
+name: Promo Event Monitor
 
 on:
   schedule:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
