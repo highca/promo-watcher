@@ -1,0 +1,2 @@
+https://r.jina.ai/https://ann365.com/sub/menu.php
+ReadTimeout(ReadTimeoutError("HTTPSConnectionPool(host='r.jina.ai', port=443): Read timed out. (read timeout=25)"))
