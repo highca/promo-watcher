@@ -6,7 +6,6 @@ import requests
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
@@ -20,10 +19,14 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# 운영 시작 시 False 권장 (첫 실행 도배 방지용은 True)
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
-SITE_TIMEOUT_SEC = 35   # 사이트 하나당 최대 처리 시간(초)
+
+# “한 사이트에서 너무 오래 끄는 느낌”을 줄이기 위한 기본 제한(밀리초)
+NAV_TIMEOUT_MS = 45_000
+ACTION_TIMEOUT_MS = 20_000
 
 
 def _stamp() -> str:
@@ -62,15 +65,6 @@ def _dedup_keep_order(items: list[dict], key_field: str = "key") -> list[dict]:
     return out
 
 
-def _new_context(browser):
-    return browser.new_context(
-        user_agent=USER_AGENT,
-        locale="ko-KR",
-        timezone_id="Asia/Seoul",
-        viewport={"width": 750, "height": 1500},
-    )
-
-
 def _save_debug(page, prefix: str):
     stamp = _stamp()
     shot = DEBUG_DIR / f"{prefix}_{stamp}.png"
@@ -102,19 +96,36 @@ def _same_host(url_a: str, url_b: str) -> bool:
         return False
 
 
-# -----------------------------
-# 공용 함수
-# -----------------------------
-
 def safe_goto(page, url: str, label: str = ""):
     print(f"[goto]{'['+label+']' if label else ''} {url}")
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(1200)
 
 
-def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
-                            exclude_patterns: list[str] | None = None,
-                            max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
+def new_page(browser):
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        locale="ko-KR",
+        timezone_id="Asia/Seoul",
+        viewport={"width": 750, "height": 1500},
+    )
+    page = context.new_page()
+    page.set_default_timeout(ACTION_TIMEOUT_MS)
+    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    return context, page
+
+
+# -----------------------------
+# 공용 수집기
+# -----------------------------
+
+def scrape_list_page_anchors(
+    page,
+    list_url: str,
+    include_patterns: list[str],
+    exclude_patterns: list[str] | None = None,
+    max_items: int = DEFAULT_MAX_ITEMS,
+) -> list[dict]:
     exclude_patterns = exclude_patterns or []
     safe_goto(page, list_url, "list")
 
@@ -152,9 +163,13 @@ def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
     return results
 
 
-def scrape_gnb_click_then_collect(page, home_url: str, menu_text: str,
-                                 include_patterns: list[str],
-                                 max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
+def scrape_gnb_click_then_collect(
+    page,
+    home_url: str,
+    menu_text: str,
+    include_patterns: list[str],
+    max_items: int = DEFAULT_MAX_ITEMS,
+) -> list[dict]:
     safe_goto(page, home_url, "home")
 
     candidates = [
@@ -171,11 +186,11 @@ def scrape_gnb_click_then_collect(page, home_url: str, menu_text: str,
             try:
                 before = page.url
                 print("[gnb] click", menu_text, "via", sel)
-                loc.first.click(timeout=8000)
+                loc.first.click(timeout=8_000)
                 clicked = True
                 page.wait_for_timeout(800)
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 except Exception:
                     pass
                 page.wait_for_timeout(1500)
@@ -198,8 +213,12 @@ def scrape_gnb_click_then_collect(page, home_url: str, menu_text: str,
     )
 
 
-def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
-                                      restrict_same_host: bool = True) -> list[dict]:
+def scrape_main_banners_by_image_links(
+    page,
+    home_url: str,
+    max_items: int = 20,
+    restrict_same_host: bool = True,
+) -> list[dict]:
     safe_goto(page, home_url, "home")
     page.wait_for_timeout(2500)
 
@@ -253,12 +272,12 @@ def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
 # -----------------------------
 
 def scrape_olens(page) -> list[dict]:
-    EVENT_LIST_URL = "https://o-lens.com/event/list"
-    safe_goto(page, EVENT_LIST_URL, "olens")
+    url = "https://o-lens.com/event/list"
+    safe_goto(page, url, "olens")
 
     cards = page.locator("div.board-information__wrapper")
     try:
-        cards.first.wait_for(timeout=25000)
+        cards.first.wait_for(timeout=25_000)
     except PlaywrightTimeoutError:
         _save_debug(page, "olens_list_timeout")
         return []
@@ -276,26 +295,23 @@ def scrape_olens(page) -> list[dict]:
         except Exception:
             title = ""
 
-        url = ""
+        detail_url = ""
         try:
-            card.click(timeout=10000)
-            page.wait_for_url(re.compile(r".*/event/view/.*"), timeout=25000)
-            url = page.url
+            card.click(timeout=10_000)
+            page.wait_for_url(re.compile(r".*/event/view/.*"), timeout=25_000)
+            detail_url = page.url
         except PlaywrightTimeoutError:
             _save_debug(page, f"olens_detail_timeout_{i+1}")
         finally:
             if "/event/view/" in page.url:
                 try:
-                    page.go_back(wait_until="domcontentloaded", timeout=30000)
-                    page.locator("div.board-information__wrapper").first.wait_for(timeout=20000)
-                    cards = page.locator("div.board-information__wrapper")
+                    page.go_back(wait_until="domcontentloaded", timeout=30_000)
+                    page.locator("div.board-information__wrapper").first.wait_for(timeout=20_000)
                 except Exception:
-                    safe_goto(page, EVENT_LIST_URL, "olens_back")
-                    page.locator("div.board-information__wrapper").first.wait_for(timeout=25000)
-                    cards = page.locator("div.board-information__wrapper")
+                    safe_goto(page, url, "olens_back")
 
-        if url:
-            results.append({"key": url, "url": url, "title": title})
+        if detail_url:
+            results.append({"key": detail_url, "url": detail_url, "title": title})
 
     return _dedup_keep_order(results)
 
@@ -305,7 +321,7 @@ def scrape_hapakristin(page) -> list[dict]:
         page,
         home_url="https://hapakristin.co.kr/",
         menu_text="진행 중인 이벤트",
-        include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products)/"],
+        include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
         max_items=DEFAULT_MAX_ITEMS,
     )
 
@@ -355,61 +371,21 @@ def scrape_i_dol(page) -> list[dict]:
         page,
         list_url="https://www.i-dol.kr/bbs/event1.php",
         include_patterns=[r"i-dol\.kr/bbs/"],
-        exclude_patterns=[r"event1\.php$"],
+        exclude_patterns=[],
         max_items=DEFAULT_MAX_ITEMS,
     )
-
-
-def scrape_shop_winc(page) -> list[dict]:
-    """
-    shop.winc.app:
-    Flutter Web이라 headless에서 화면이 하얗게 보이거나 메뉴 클릭이 실패할 수 있습니다.
-    대신 HTML에 SEO용으로 숨겨진 nav(display:none)에 이벤트 링크가 포함되어 있으므로,
-    /event/{id} 링크를 직접 수집합니다.
-    """
-    home = "https://shop.winc.app/"
-    safe_goto(page, home, "winc_home")
-
-    # DOM에 존재하는 이벤트 링크를 수집 (숨김 nav 포함)
-    anchors = page.locator('a[href^="/event/"]').all()
-    print("[winc] /event anchors:", len(anchors))
-
-    results = []
-    for a in anchors[:DEFAULT_MAX_ITEMS]:
-        href = a.get_attribute("href") or ""
-        if not href:
-            continue
-
-        url = _abs_url(page.url, href)  # 절대 URL로 변환
-        m = re.search(r"/event/(\d+)", url)
-        if not m:
-            continue
-
-        title = (a.inner_text() or "").strip()
-        if not title:
-            title = f"event/{m.group(1)}"
-
-        key = f"winc:event:{m.group(1)}"
-        results.append({"key": key, "url": url, "title": title})
-
-    results = _dedup_keep_order(results)
-    if not results:
-        _save_debug(page, "winc_no_event_links")
-
-    return results
 
 
 def scrape_ann365(page) -> list[dict]:
     safe_goto(page, "https://ann365.com/sub/menu.php", "ann365")
 
-    # SALE 클릭 시도
     clicked_sale = False
     for sel in ['a:has-text("SALE")', 'button:has-text("SALE")', 'div:has-text("SALE")']:
         loc = page.locator(sel)
         if loc.count() > 0:
             try:
                 print("[ann365] click SALE via", sel)
-                loc.first.click(timeout=8000)
+                loc.first.click(timeout=8_000)
                 clicked_sale = True
                 page.wait_for_timeout(2000)
                 break
@@ -422,7 +398,7 @@ def scrape_ann365(page) -> list[dict]:
     return scrape_list_page_anchors(
         page,
         list_url=page.url,
-        include_patterns=[r"ann365\.com/.*(event|이벤트|menu\.php)"],
+        include_patterns=[r"ann365\.com/.*(event|이벤트|prd_event=|menu\.php)"],
         exclude_patterns=[],
         max_items=DEFAULT_MAX_ITEMS,
     )
@@ -440,48 +416,69 @@ def scrape_gemhour(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://gemhour.co.kr/", max_items=20, restrict_same_host=True)
 
 
+def scrape_shop_winc(page) -> list[dict]:
+    """
+    shop.winc.app:
+    Flutter Web이라 headless에서 화면이 하얗게 렌더링될 수 있음.
+    HTML에 SEO용으로 숨겨진 nav(display:none)에 /event/{id} 링크가 포함되는 경우가 있어,
+    클릭 대신 /event/ 링크를 직접 수집한다.
+    """
+    home = "https://shop.winc.app/"
+    safe_goto(page, home, "winc_home")
+
+    anchors = page.locator('a[href^="/event/"]').all()
+    print("[winc] /event anchors:", len(anchors))
+
+    results = []
+    for a in anchors[:DEFAULT_MAX_ITEMS]:
+        href = a.get_attribute("href") or ""
+        if not href:
+            continue
+        url = _abs_url(page.url, href)
+        m = re.search(r"/event/(\d+)", url)
+        if not m:
+            continue
+
+        title = (a.inner_text() or "").strip() or f"event/{m.group(1)}"
+        key = f"winc:event:{m.group(1)}"
+        results.append({"key": key, "url": url, "title": title})
+
+    results = _dedup_keep_order(results)
+    if not results:
+        _save_debug(page, "winc_no_event_links")
+        # fallback: 홈 자체라도 키로 저장(변경 감지 보조)
+        results = [{"key": "winc:home", "url": home, "title": "이벤트(홈)"}]
+
+    return results
+
+
 # -----------------------------
-# Runner (사이트별 타임아웃)
+# Runner (스레드 없이 순차 실행)
 # -----------------------------
 
 SITES = [
     {"site": "O-Lens", "fn": scrape_olens},
     {"site": "Hapa Kristin", "fn": scrape_hapakristin},
     {"site": "Lens-me", "fn": scrape_lensme},
+    {"site": "MYFiPN", "fn": scrape_myfipn},
+    {"site": "CHUU Lens", "fn": scrape_chuulens},
+    {"site": "Gemhour", "fn": scrape_gemhour},
     {"site": "i-sha", "fn": scrape_i_sha},
     {"site": "shop.winc.app", "fn": scrape_shop_winc},
     {"site": "ann365", "fn": scrape_ann365},
     {"site": "lenbling", "fn": scrape_lenbling},
     {"site": "yourly", "fn": scrape_yourly},
     {"site": "i-dol", "fn": scrape_i_dol},
-    {"site": "MYFiPN", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "fn": scrape_chuulens},
-    {"site": "Gemhour", "fn": scrape_gemhour},
 ]
 
-def run_one_site_with_timeout(browser, site: str, fn):
-    """
-    각 사이트를 별도 스레드로 실행 + 타임아웃으로 강제 스킵
-    """
-    ctx = _new_context(browser)
-    page = ctx.new_page()
-    page.set_default_timeout(30000)
-
-    try:
-        return fn(page) or []
-    finally:
-        try:
-            ctx.close()
-        except Exception:
-            pass
 
 def main():
     state = load_state()
     if "seen" not in state:
         state["seen"] = {}
 
-    print("[main] sites:", len(SITES))
     print("[main] loaded state sites:", list(state["seen"].keys()))
+    any_state_changed = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -493,33 +490,35 @@ def main():
             ],
         )
 
-        any_state_changed = False
+        for cfg in SITES:
+            site = cfg["site"]
+            fn = cfg["fn"]
 
-        for site_cfg in SITES:
-            site = site_cfg["site"]
-            fn = site_cfg["fn"]
-
-            print("\n[main] site start:", site)
-
-            items = []
+            print("\n[main] site:", site)
             start = time.time()
 
-            # 사이트별 하드 타임아웃
+            context = None
+            page = None
+            items = []
+
             try:
-                with ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(run_one_site_with_timeout, browser, site, fn)
-                    items = fut.result(timeout=SITE_TIMEOUT_SEC)
-            except FutureTimeoutError:
-                print(f"[main] site timeout({SITE_TIMEOUT_SEC}s):", site)
-                # 타임아웃 시에도 다음으로 진행
-                items = []
+                context, page = new_page(browser)
+                items = fn(page) or []
             except Exception as e:
                 print("[main] site error:", site, repr(e))
+                if page is not None:
+                    _save_debug(page, f"error_{site.replace(' ', '_')}")
                 items = []
+            finally:
+                try:
+                    if context is not None:
+                        context.close()
+                except Exception:
+                    pass
 
             elapsed = time.time() - start
             items = _dedup_keep_order(items)
-            print("[main] site done:", site, "scraped:", len(items), f"elapsed={elapsed:.1f}s")
+            print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
             seen_set = set(state["seen"].get(site, []))
 
@@ -557,6 +556,7 @@ def main():
         print("[main] state saved:", str(STATE_PATH))
     else:
         print("[main] no state changes")
+
 
 if __name__ == "__main__":
     main()
