@@ -457,18 +457,18 @@ def scrape_shop_winc(page) -> list[dict]:
 # -----------------------------
 
 SITES = [
-    {"site": "O-Lens", "fn": scrape_olens},
-    {"site": "Hapa Kristin", "fn": scrape_hapakristin},
-    {"site": "Lens-me", "fn": scrape_lensme},
-    {"site": "MYFiPN", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "fn": scrape_chuulens},
-    {"site": "Gemhour", "fn": scrape_gemhour},
-    {"site": "i-sha", "fn": scrape_i_sha},
-    {"site": "shop.winc.app", "fn": scrape_shop_winc},
-    {"site": "ann365", "fn": scrape_ann365},
-    {"site": "lenbling", "fn": scrape_lenbling},
-    {"site": "yourly", "fn": scrape_yourly},
-    {"site": "i-dol", "fn": scrape_i_dol},
+    {"site": "olens", "display": "O-Lens", "fn": scrape_olens},
+    {"site": "hapakristin", "display": "Hapa Kristin", "fn": scrape_hapakristin},
+    {"site": "lensme", "display": "Lens-me", "fn": scrape_lensme},
+    {"site": "myfipn", "display": "MYFiPN", "fn": scrape_myfipn},
+    {"site": "chuulens", "display": "CHUU LENS", "fn": scrape_chuulens},
+    {"site": "gemhour", "display": "Gemhour", "fn": scrape_gemhour},
+    {"site": "isha", "display": "i-sha", "fn": scrape_i_sha},
+    {"site": "winc", "display": "Winc", "fn": scrape_shop_winc},
+    {"site": "ann365", "display": "ANN365", "fn": scrape_ann365},
+    {"site": "lenbling", "display": "Lenbling", "fn": scrape_lenbling},
+    {"site": "yourly", "display": "Yourly", "fn": scrape_yourly},
+    {"site": "idol", "display": "i-dol", "fn": scrape_i_dol},
 ]
 
 
