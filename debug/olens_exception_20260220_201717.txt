@@ -1,0 +1,1 @@
+Error('Page.goto: net::ERR_NETWORK_CHANGED at https://o-lens.com/event/list\nCall log:\n  - navigating to "https://o-lens.com/event/list", waiting until "domcontentloaded"\n')

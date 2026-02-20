@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://hapakristin.co.kr/" is interrupted by another navigation to "chrome-error://chromewebdata/"\nCall log:\n  - navigating to "https://hapakristin.co.kr/", waiting until "domcontentloaded"\n')

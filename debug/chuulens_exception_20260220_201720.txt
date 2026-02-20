@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://chuulens.kr/" is interrupted by another navigation to "https://www.myfipn.com/"\nCall log:\n  - navigating to "https://chuulens.kr/", waiting until "domcontentloaded"\n')
