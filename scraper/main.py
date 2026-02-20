@@ -19,8 +19,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# 운영 시작 시 보통 False 권장 (첫 실행 도배 방지용은 True)
-# 이미 state가 저장된 상태라면 False로 두셔도 괜찮습니다.
+# 이미 state가 저장된 상태라면 False 유지 권장
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
@@ -446,24 +445,24 @@ def scrape_shop_winc(page) -> list[dict]:
 
 
 # -----------------------------
-# Slack 표시명(display) 분리된 사이트 목록
+# Slack 표시명(display) 한글화
 # site: state 저장용 키 (기존 값 유지)
-# display: Slack 표시용 이름 (원하는 대로 수정)
+# display: Slack 표시용 이름 (한글)
 # -----------------------------
 
 SITES = [
-    {"site": "O-Lens", "display": "O-Lens", "fn": scrape_olens},
-    {"site": "Hapa Kristin", "display": "Hapa Kristin", "fn": scrape_hapakristin},
-    {"site": "Lens-me", "display": "Lens-me", "fn": scrape_lensme},
-    {"site": "MYFiPN", "display": "MYFiPN", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "display": "CHUU LENS", "fn": scrape_chuulens},
-    {"site": "Gemhour", "display": "Gemhour", "fn": scrape_gemhour},
-    {"site": "i-sha", "display": "i-sha", "fn": scrape_i_sha},
-    {"site": "shop.winc.app", "display": "Winc", "fn": scrape_shop_winc},
-    {"site": "ann365", "display": "ANN365", "fn": scrape_ann365},
-    {"site": "lenbling", "display": "Lenbling", "fn": scrape_lenbling},
-    {"site": "yourly", "display": "Yourly", "fn": scrape_yourly},
-    {"site": "i-dol", "display": "i-dol", "fn": scrape_i_dol},
+    {"site": "O-Lens", "display": "오렌즈", "fn": scrape_olens},
+    {"site": "Hapa Kristin", "display": "하파크리스틴", "fn": scrape_hapakristin},
+    {"site": "Lens-me", "display": "렌즈미", "fn": scrape_lensme},
+    {"site": "MYFiPN", "display": "마이핍앤", "fn": scrape_myfipn},
+    {"site": "CHUU Lens", "display": "츄렌즈", "fn": scrape_chuulens},
+    {"site": "Gemhour", "display": "젬아워", "fn": scrape_gemhour},
+    {"site": "i-sha", "display": "아이샤", "fn": scrape_i_sha},
+    {"site": "shop.winc.app", "display": "윙크", "fn": scrape_shop_winc},
+    {"site": "ann365", "display": "앤365", "fn": scrape_ann365},
+    {"site": "lenbling", "display": "렌블링", "fn": scrape_lenbling},
+    {"site": "yourly", "display": "유얼리", "fn": scrape_yourly},
+    {"site": "i-dol", "display": "아이돌렌즈", "fn": scrape_i_dol},
 ]
 
 
@@ -486,8 +485,8 @@ def main():
         )
 
         for cfg in SITES:
-            site_key = cfg["site"]                  # state 저장 키
-            site_name = cfg.get("display", site_key)  # Slack 표시명
+            site_key = cfg["site"]                   # state 저장 키
+            site_name = cfg.get("display", site_key) # Slack 표시명(한글)
             fn = cfg["fn"]
 
             print("\n[main] site:", site_key, "(", site_name, ")")
