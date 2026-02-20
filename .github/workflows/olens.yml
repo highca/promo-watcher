@@ -1,16 +1,18 @@
-name: Promo Event Monitor
+# .github/workflows/olens.yml
+name: 프로모션 모니터링 (신규 알림)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # 5분 주기 (GitHub Actions 스케줄은 지연될 수 있음)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
-
-concurrency:
-  group: promo-monitor
-  cancel-in-progress: true
 
 permissions:
   contents: write
+
+concurrency:
+  group: promo-watcher
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -28,31 +30,22 @@ jobs:
 
       - name: Install Python deps
         run: |
-          pip install -U pip
+          python -m pip install -U pip
           pip install playwright requests
 
       - name: Install Chromium for Playwright
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper
-        env:
-          SLACK_WEBHOOK_URL_PROD: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
-          SLACK_WEBHOOK_URL_TEST: ${{ secrets.SLACK_WEBHOOK_URL_TEST }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
-        run: |
-          python scraper/main.py
-
-      - name: Run scraper
+      - name: Run scraper (print version)
         env:
           SLACK_WEBHOOK_URL_PROD: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
           SLACK_WEBHOOK_URL_TEST: ${{ secrets.SLACK_WEBHOOK_URL_TEST }}
         run: |
-          git rev-parse HEAD
-          ls -al scraper
-          sed -n '1,80p' scraper/main.py
+          echo "[debug] commit=$(git rev-parse HEAD)"
+          echo "[debug] branch=$(git rev-parse --abbrev-ref HEAD)"
+          echo "[debug] file_head:"
+          sed -n '1,120p' scraper/main.py | sed 's/^/[debug] /'
           python scraper/main.py
 
       - name: Upload debug artifacts
@@ -68,6 +61,6 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add -A
-            git commit -m "Update promo state"
+            git commit -m "Update seen state"
             git push
           fi
