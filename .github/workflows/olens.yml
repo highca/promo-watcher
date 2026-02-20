@@ -5,6 +5,10 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: promo-monitor
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
