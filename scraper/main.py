@@ -19,11 +19,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# 이미 state가 저장된 상태라면 False 유지 권장
+# 이미 state가 쌓여있으면 False 유지 권장
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
-
 NAV_TIMEOUT_MS = 45_000
 ACTION_TIMEOUT_MS = 20_000
 
@@ -101,17 +100,38 @@ def safe_goto(page, url: str, label: str = ""):
     page.wait_for_timeout(1200)
 
 
-def new_page(browser):
+def new_page(browser, *, viewport_w=1200, viewport_h=800):
     context = browser.new_context(
         user_agent=USER_AGENT,
         locale="ko-KR",
         timezone_id="Asia/Seoul",
-        viewport={"width": 750, "height": 1500},
+        viewport={"width": viewport_w, "height": viewport_h},
     )
     page = context.new_page()
     page.set_default_timeout(ACTION_TIMEOUT_MS)
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     return context, page
+
+
+def try_close_common_popups(page):
+    # 아주 보수적으로 “닫기/×”류만 시도 (실패해도 무해)
+    candidates = [
+        'button:has-text("닫기")',
+        'button:has-text("Close")',
+        'button[aria-label="Close"]',
+        'button[aria-label="close"]',
+        'button:has-text("×")',
+        'a:has-text("닫기")',
+        'a:has-text("×")',
+    ]
+    for sel in candidates:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            try:
+                loc.first.click(timeout=1500)
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
 
 
 # -----------------------------
@@ -127,6 +147,7 @@ def scrape_list_page_anchors(
 ) -> list[dict]:
     exclude_patterns = exclude_patterns or []
     safe_goto(page, list_url, "list")
+    try_close_common_popups(page)
 
     anchors = page.locator("a[href]").all()
     base = page.url
@@ -162,56 +183,6 @@ def scrape_list_page_anchors(
     return results
 
 
-def scrape_gnb_click_then_collect(
-    page,
-    home_url: str,
-    menu_text: str,
-    include_patterns: list[str],
-    max_items: int = DEFAULT_MAX_ITEMS,
-) -> list[dict]:
-    safe_goto(page, home_url, "home")
-
-    candidates = [
-        f'a:has-text("{menu_text}")',
-        f'button:has-text("{menu_text}")',
-        f'div:has-text("{menu_text}")',
-        f'span:has-text("{menu_text}")',
-    ]
-
-    clicked = False
-    for sel in candidates:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                before = page.url
-                print("[gnb] click", menu_text, "via", sel)
-                loc.first.click(timeout=8_000)
-                clicked = True
-                page.wait_for_timeout(800)
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(1500)
-                after = page.url
-                print("[gnb] url:", before, "->", after)
-                break
-            except Exception:
-                pass
-
-    if not clicked:
-        _save_debug(page, f"gnb_click_fail_{menu_text}")
-        return []
-
-    return scrape_list_page_anchors(
-        page,
-        list_url=page.url,
-        include_patterns=include_patterns,
-        exclude_patterns=[],
-        max_items=max_items,
-    )
-
-
 def scrape_main_banners_by_image_links(
     page,
     home_url: str,
@@ -219,6 +190,7 @@ def scrape_main_banners_by_image_links(
     restrict_same_host: bool = True,
 ) -> list[dict]:
     safe_goto(page, home_url, "home")
+    try_close_common_popups(page)
     page.wait_for_timeout(2500)
 
     base = page.url
@@ -315,75 +287,82 @@ def scrape_olens(page) -> list[dict]:
     return _dedup_keep_order(results)
 
 
+def _hapakristin_find_event_list_url_from_home(page) -> str:
+    # 홈에서 /events/xxxx 형태나 이벤트 관련 링크를 최대한 넓게 찾음(숨김/푸터 포함)
+    anchors = page.locator("a[href]").all()
+    base = page.url
+
+    candidates = []
+    for a in anchors:
+        href = a.get_attribute("href") or ""
+        url = _abs_url(base, href)
+        if not url:
+            continue
+        if not _same_host(base, url):
+            continue
+
+        # /events/숫자 형태가 가장 유력
+        if re.search(r"hapakristin\.co\.kr/events/\d+", url):
+            candidates.append(url)
+            continue
+
+        # 혹시 /events 라우팅이 다른 형태로 노출될 때 대비
+        if re.search(r"hapakristin\.co\.kr/.{0,40}event", url, re.IGNORECASE):
+            candidates.append(url)
+
+    # 가장 짧고 “events/숫자” 우선
+    candidates = list(dict.fromkeys(candidates))
+    candidates.sort(key=lambda x: (0 if re.search(r"/events/\d+", x) else 1, len(x)))
+    return candidates[0] if candidates else ""
+
+
 def scrape_hapakristin(page) -> list[dict]:
+    # 하파크리스틴은 hover 메뉴가 “데스크톱 레이아웃”에서만 잘 잡히는 경우가 많아서
+    # (1) 홈에서 이벤트 리스트 URL을 직접 찾는 방식(가장 안정적)
+    # (2) 못 찾으면 /events/xxxx 후보를 시도
     home = "https://hapakristin.co.kr/"
     safe_goto(page, home, "hapakristin_home")
+    try_close_common_popups(page)
+    page.wait_for_timeout(2000)
 
-    # 1) 상위 메뉴(이벤트/프로모션 등)를 hover해서 드롭다운을 띄움
-    parent_candidates = [
-        'nav a:has-text("이벤트")',
-        'header a:has-text("이벤트")',
-        'a:has-text("이벤트")',
-        'nav a:has-text("EVENT")',
-        'header a:has-text("EVENT")',
-        'a:has-text("EVENT")',
+    event_url = _hapakristin_find_event_list_url_from_home(page)
+    if event_url:
+        print("[hapakristin] found event url from home:", event_url)
+        return scrape_list_page_anchors(
+            page,
+            list_url=event_url,
+            include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
+            exclude_patterns=[],
+            max_items=DEFAULT_MAX_ITEMS,
+        )
+
+    # 후보 접근: 과거에 잡힌 형태(/events/6824 등)들을 여러 개 시도
+    guesses = [
+        "https://hapakristin.co.kr/events",
+        "https://hapakristin.co.kr/events/6824",
+        "https://hapakristin.co.kr/events/1",
+        "https://hapakristin.co.kr/pages/event",
     ]
 
-    hovered = False
-    for sel in parent_candidates:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                loc.first.hover(timeout=8_000)
-                page.wait_for_timeout(700)
-                hovered = True
-                break
-            except Exception:
-                pass
+    for g in guesses:
+        try:
+            safe_goto(page, g, "hapakristin_guess")
+            try_close_common_popups(page)
+            page.wait_for_timeout(1500)
+            items = scrape_list_page_anchors(
+                page,
+                list_url=page.url,
+                include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
+                exclude_patterns=[],
+                max_items=DEFAULT_MAX_ITEMS,
+            )
+            if items:
+                return items
+        except Exception:
+            pass
 
-    if not hovered:
-        _save_debug(page, "hapakristin_hover_fail")
-        return []
-
-    # 2) hover로 생성된 하위 메뉴 중 "진행 중인 이벤트" 클릭
-    submenu_candidates = [
-        'a:has-text("진행 중인 이벤트")',
-        'a:has-text("진행중인 이벤트")',
-        'a:has-text("진행 이벤트")',
-    ]
-
-    clicked = False
-    for sel in submenu_candidates:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                before = page.url
-                loc.first.click(timeout=8_000)
-                page.wait_for_timeout(800)
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
-                except Exception:
-                    pass
-                after = page.url
-                print("[hapakristin] submenu click url:", before, "->", after)
-                clicked = True
-                break
-            except Exception:
-                pass
-
-    if not clicked:
-        _save_debug(page, "hapakristin_submenu_click_fail")
-        return []
-
-    # 3) 도착한 페이지에서 이벤트/프로모션 링크 수집
-    # (사이트 구조상 /events/XXXX 또는 상품/컬렉션으로 연결될 수 있어 범위를 넓게 잡음)
-    return scrape_list_page_anchors(
-        page,
-        list_url=page.url,
-        include_patterns=[r"hapakristin\.co\.kr/(collections|pages|products|events)/"],
-        exclude_patterns=[],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
+    _save_debug(page, "hapakristin_event_discovery_fail")
+    return []
 
 
 def scrape_lensme(page) -> list[dict]:
@@ -436,34 +415,6 @@ def scrape_i_dol(page) -> list[dict]:
     )
 
 
-def scrape_ann365(page) -> list[dict]:
-    safe_goto(page, "https://ann365.com/sub/menu.php", "ann365")
-
-    clicked_sale = False
-    for sel in ['a:has-text("SALE")', 'button:has-text("SALE")', 'div:has-text("SALE")']:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                print("[ann365] click SALE via", sel)
-                loc.first.click(timeout=8_000)
-                clicked_sale = True
-                page.wait_for_timeout(2000)
-                break
-            except Exception:
-                pass
-
-    if not clicked_sale:
-        print("[ann365] SALE click failed (continue)")
-
-    return scrape_list_page_anchors(
-        page,
-        list_url=page.url,
-        include_patterns=[r"ann365\.com/.*(event|이벤트|prd_event=|menu\.php)"],
-        exclude_patterns=[],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
-
-
 def scrape_myfipn(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://www.myfipn.com/", max_items=20, restrict_same_host=True)
 
@@ -477,27 +428,39 @@ def scrape_gemhour(page) -> list[dict]:
 
 
 def scrape_shop_winc(page) -> list[dict]:
+    # shop.winc.app은 Flutter(Web)라 첫 로딩이 흰 화면처럼 보일 수 있음.
+    # HTML에 숨겨진 nav가 있고, /event/xxx 링크가 존재할 수 있으므로 그걸 먼저 활용.
     home = "https://shop.winc.app/"
     safe_goto(page, home, "winc_home")
+    page.wait_for_timeout(3500)
 
-    anchors = page.locator('a[href^="/event/"]').all()
-    print("[winc] /event anchors:", len(anchors))
-
+    # 숨김 nav 포함해서 /event/숫자 링크 수집
+    anchors = page.locator('a[href]').all()
     results = []
-    for a in anchors[:DEFAULT_MAX_ITEMS]:
+    seen = set()
+
+    for a in anchors:
         href = a.get_attribute("href") or ""
-        if not href:
-            continue
         url = _abs_url(page.url, href)
+        if not url:
+            continue
+        if not _same_host(page.url, url):
+            continue
         m = re.search(r"/event/(\d+)", url)
         if not m:
+            continue
+        if url in seen:
             continue
 
         title = (a.inner_text() or "").strip() or f"event/{m.group(1)}"
         key = f"winc:event:{m.group(1)}"
         results.append({"key": key, "url": url, "title": title})
+        seen.add(url)
+        if len(results) >= DEFAULT_MAX_ITEMS:
+            break
 
     results = _dedup_keep_order(results)
+    print("[winc] events:", len(results))
     if not results:
         _save_debug(page, "winc_no_event_links")
         results = [{"key": "winc:home", "url": home, "title": "이벤트(홈)"}]
@@ -505,25 +468,36 @@ def scrape_shop_winc(page) -> list[dict]:
     return results
 
 
-# -----------------------------
-# Slack 표시명(display) 한글화
-# site: state 저장용 키(기존 유지)
-# display: Slack 표시용 이름(한글)
-# -----------------------------
+def scrape_ann365(page) -> list[dict]:
+    safe_goto(page, "https://ann365.com/sub/menu.php", "ann365")
+    try_close_common_popups(page)
+    page.wait_for_timeout(1500)
 
+    # ann365는 SALE 하위에서 이벤트 링크가 바뀌는 구조라,
+    # menu.php에서 이벤트 관련 링크를 넓게 수집
+    return scrape_list_page_anchors(
+        page,
+        list_url=page.url,
+        include_patterns=[r"ann365\.com/.*(prd_event=|event|이벤트|menu\.php|product/list\.php)"],
+        exclude_patterns=[],
+        max_items=DEFAULT_MAX_ITEMS,
+    )
+
+
+# Slack 표시명 한글화
 SITES = [
-    {"site": "O-Lens", "display": "오렌즈", "fn": scrape_olens},
-    {"site": "Hapa Kristin", "display": "하파크리스틴", "fn": scrape_hapakristin},
-    {"site": "Lens-me", "display": "렌즈미", "fn": scrape_lensme},
-    {"site": "MYFiPN", "display": "마이핍앤", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "display": "츄렌즈", "fn": scrape_chuulens},
-    {"site": "Gemhour", "display": "젬아워", "fn": scrape_gemhour},
-    {"site": "i-sha", "display": "아이샤", "fn": scrape_i_sha},
-    {"site": "shop.winc.app", "display": "윙크", "fn": scrape_shop_winc},
-    {"site": "ann365", "display": "앤365", "fn": scrape_ann365},
-    {"site": "lenbling", "display": "렌블링", "fn": scrape_lenbling},
-    {"site": "yourly", "display": "유얼리", "fn": scrape_yourly},
-    {"site": "i-dol", "display": "아이돌렌즈", "fn": scrape_i_dol},
+    {"site": "O-Lens", "display": "오렌즈", "fn": ("normal", scrape_olens)},
+    {"site": "Hapa Kristin", "display": "하파크리스틴", "fn": ("desktop", scrape_hapakristin)},
+    {"site": "Lens-me", "display": "렌즈미", "fn": ("normal", scrape_lensme)},
+    {"site": "MYFiPN", "display": "마이핍앤", "fn": ("normal", scrape_myfipn)},
+    {"site": "CHUU Lens", "display": "츄렌즈", "fn": ("normal", scrape_chuulens)},
+    {"site": "Gemhour", "display": "젬아워", "fn": ("normal", scrape_gemhour)},
+    {"site": "i-sha", "display": "아이샤", "fn": ("normal", scrape_i_sha)},
+    {"site": "shop.winc.app", "display": "윙크", "fn": ("normal", scrape_shop_winc)},
+    {"site": "ann365", "display": "앤365", "fn": ("normal", scrape_ann365)},
+    {"site": "lenbling", "display": "렌블링", "fn": ("normal", scrape_lenbling)},
+    {"site": "yourly", "display": "유얼리", "fn": ("normal", scrape_yourly)},
+    {"site": "i-dol", "display": "아이돌렌즈", "fn": ("normal", scrape_i_dol)},
 ]
 
 
@@ -548,7 +522,7 @@ def main():
         for cfg in SITES:
             site_key = cfg["site"]
             site_name = cfg.get("display", site_key)
-            fn = cfg["fn"]
+            mode, fn = cfg["fn"]
 
             print("\n[main] site:", site_key, "(", site_name, ")")
             start = time.time()
@@ -558,7 +532,12 @@ def main():
             items = []
 
             try:
-                context, page = new_page(browser)
+                # 하파크리스틴은 데스크톱 레이아웃을 강제
+                if mode == "desktop":
+                    context, page = new_page(browser, viewport_w=1400, viewport_h=900)
+                else:
+                    context, page = new_page(browser, viewport_w=1200, viewport_h=800)
+
                 items = fn(page) or []
             except Exception as e:
                 print("[main] site error:", site_key, repr(e))
