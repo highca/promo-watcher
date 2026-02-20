@@ -1,0 +1,2 @@
+https://hapakristin.co.kr/events/6824 status=404 reason=http_status
+https://hapakristin.co.kr/events/6724 status=404 reason=http_status
