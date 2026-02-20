@@ -1,822 +1,681 @@
 # scraper/main.py
+# -*- coding: utf-8 -*-
 
 import os
 import re
 import json
 import time
+import glob
+import hashlib
+import datetime
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple, Set
+
 import requests
-from pathlib import Path
-from datetime import datetime
-from urllib.parse import urljoin, urlparse
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-SLACK_WEBHOOK_URL_PROD = os.environ.get("SLACK_WEBHOOK_URL_PROD", "").strip()
-SLACK_WEBHOOK_URL_TEST = os.environ.get("SLACK_WEBHOOK_URL_TEST", "").strip()
-
-GITHUB_SERVER_URL = os.environ.get("GITHUB_SERVER_URL", "").strip()
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
-GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "").strip()
-
-STATE_PATH = Path("state/seen.json")
-DEBUG_DIR = Path("debug")
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-INIT_SILENT = False
-
-DEFAULT_MAX_ITEMS = 30
-NAV_TIMEOUT_MS = 45_000
-ACTION_TIMEOUT_MS = 20_000
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 
-def _stamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+# ----------------------------
+# 설정
+# ----------------------------
+
+STATE_DIR = "state"
+SEEN_FILE = os.path.join(STATE_DIR, "seen.json")
+DEBUG_NOTIFIED_FILE = os.path.join(STATE_DIR, "debug_notified.json")
+DEBUG_DIR = "debug"
+
+OPS_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()         # 운영(신규 알림)
+TEST_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL_TEST", "").strip()   # 테스트(경고 알림)
+
+RUN_URL = os.environ.get("GITHUB_RUN_URL", "").strip()  # optional, workflow에서 env로 넘기면 좋음
+
+DEFAULT_TIMEOUT_MS = 25_000
+NAV_TIMEOUT_MS = 35_000
+
+# “경고로 볼지” 판단을 더 엄격하게(=불필요 경고 줄이기)
+# - 아래 조건을 만족하면 debug를 만들어도 경고를 보내지 않음
+HAPAKRISTIN_FIXED_EVENT_IDS = [6824, 6724]
 
 
-def _run_url() -> str:
-    if GITHUB_SERVER_URL and GITHUB_REPOSITORY and GITHUB_RUN_ID:
-        return f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/actions/runs/{GITHUB_RUN_ID}"
-    return ""
+# ----------------------------
+# 유틸
+# ----------------------------
 
+def ensure_dirs():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(DEBUG_DIR, exist_ok=True)
 
-def post_slack(url: str, text: str):
-    if not url:
+def now_kst_str() -> str:
+    # Actions는 UTC 기반이지만 표시는 KST로
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(tz=kst).strftime("%Y-%m-%d %H:%M:%S KST")
+
+def ts_tag() -> str:
+    return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+def stable_id(site_key: str, url: str, title: str = "") -> str:
+    s = f"{site_key}::{url}::{title}".encode("utf-8")
+    return hashlib.sha1(s).hexdigest()[:16]
+
+def load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def save_json(path: str, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def post_slack(webhook: str, text: str):
+    if not webhook:
+        print("[slack] webhook not set, skip")
         return
-    resp = requests.post(url, json={"text": text}, timeout=15)
-    resp.raise_for_status()
-
-
-def post_slack_prod(text: str):
-    post_slack(SLACK_WEBHOOK_URL_PROD, text)
-
-
-def post_slack_test(text: str):
-    post_slack(SLACK_WEBHOOK_URL_TEST, text)
-
-
-def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {}
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
+        resp = requests.post(webhook, json={"text": text}, timeout=15)
+        if resp.status_code >= 400:
+            print(f"[slack] failed {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[slack] exception: {e}")
 
+def list_debug_files() -> List[str]:
+    files = []
+    if os.path.isdir(DEBUG_DIR):
+        for p in glob.glob(os.path.join(DEBUG_DIR, "*")):
+            if os.path.isfile(p):
+                files.append(os.path.basename(p))
+    return sorted(files)
 
-def save_state(state: dict):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_debug_text(name_prefix: str, content: str) -> str:
+    fn = f"{name_prefix}_{ts_tag()}.txt"
+    path = os.path.join(DEBUG_DIR, fn)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[debug] saved {path}")
+    return fn
 
+def save_debug_html_png(page, name_prefix: str) -> Tuple[str, str]:
+    html_fn = f"{name_prefix}_{ts_tag()}.html"
+    png_fn = f"{name_prefix}_{ts_tag()}.png"
 
-def _dedup_keep_order(items: list[dict], key_field: str = "key") -> list[dict]:
-    out, s = [], set()
-    for it in items:
-        k = it.get(key_field) or it.get("url") or it.get("title")
-        if not k:
-            continue
-        if k not in s:
-            out.append(it)
-            s.add(k)
-    return out
+    html_path = os.path.join(DEBUG_DIR, html_fn)
+    png_path = os.path.join(DEBUG_DIR, png_fn)
 
-
-def _list_debug_files() -> set[str]:
-    if not DEBUG_DIR.exists():
-        return set()
-    return set(p.name for p in DEBUG_DIR.glob("*") if p.is_file())
-
-
-def _filter_site_debug_files(site_key: str, files: set[str]) -> list[str]:
-    safe = re.sub(r"[^0-9A-Za-z가-힣]+", "_", site_key).strip("_")
-    picked = [f for f in sorted(files) if safe and safe in f]
-    return picked if picked else sorted(files)
-
-
-def _save_debug(page, prefix: str):
-    stamp = _stamp()
-    shot = DEBUG_DIR / f"{prefix}_{stamp}.png"
-    html = DEBUG_DIR / f"{prefix}_{stamp}.html"
     try:
-        page.screenshot(path=str(shot), full_page=True)
-    except Exception:
-        pass
-    try:
-        html.write_text(page.content(), encoding="utf-8")
-    except Exception:
-        pass
-    print("[debug] saved", str(shot), str(html))
+        html = page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        page.screenshot(path=png_path, full_page=True)
+        print(f"[debug] saved {png_path} {html_path}")
+    except Exception as e:
+        # 최소한 텍스트라도 남김
+        save_debug_text(name_prefix + "_exception", str(e))
+        return ("", "")
 
+    return (html_fn, png_fn)
 
-def _save_debug_text(prefix: str, text: str):
-    stamp = _stamp()
-    p = DEBUG_DIR / f"{prefix}_{stamp}.txt"
-    try:
-        p.write_text(text, encoding="utf-8")
-    except Exception:
-        pass
-    print("[debug] saved", str(p))
+def safe_goto(page, url: str, label: str):
+    print(f"[goto][{label}] {url}")
+    return page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
+def norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-def _abs_url(base: str, href: str) -> str:
+def abs_url(base: str, href: str) -> str:
     if not href:
         return ""
     href = href.strip()
-    if href.startswith("javascript:"):
-        return ""
-    return urljoin(base, href)
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return base.rstrip("/") + href
+    return base.rstrip("/") + "/" + href
 
 
-def _same_host(url_a: str, url_b: str) -> bool:
-    try:
-        return urlparse(url_a).netloc == urlparse(url_b).netloc
-    except Exception:
-        return False
+# ----------------------------
+# 데이터 모델
+# ----------------------------
 
+@dataclass
+class Item:
+    site_key: str
+    site_name: str
+    title: str
+    url: str
+    item_id: str
 
-def safe_goto(page, url: str, label: str = "", wait: str = "domcontentloaded"):
-    print(f"[goto]{'['+label+']' if label else ''} {url}")
-    resp = page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
-    page.wait_for_timeout(1000)
-    status = None
-    try:
-        status = resp.status if resp is not None else None
-    except Exception:
-        status = None
-    return status
-
-
-def new_page(browser, *, viewport_w=1200, viewport_h=800):
-    context = browser.new_context(
-        user_agent=USER_AGENT,
-        locale="ko-KR",
-        timezone_id="Asia/Seoul",
-        viewport={"width": viewport_w, "height": viewport_h},
+def make_item(site_key: str, site_name: str, title: str, url: str) -> Item:
+    return Item(
+        site_key=site_key,
+        site_name=site_name,
+        title=norm_text(title) if title else "(제목 미확인)",
+        url=url,
+        item_id=stable_id(site_key, url, title or "")
     )
-    context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-    page = context.new_page()
-    page.set_default_timeout(ACTION_TIMEOUT_MS)
-    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
-    return context, page
 
 
-def try_close_common_popups(page):
-    candidates = [
-        'button:has-text("닫기")',
-        'button:has-text("Close")',
-        'button[aria-label="Close"]',
-        'button[aria-label="close"]',
-        'button:has-text("×")',
-        'a:has-text("닫기")',
-        'a:has-text("×")',
-    ]
-    for sel in candidates:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                loc.first.click(timeout=1500)
-                page.wait_for_timeout(300)
-            except Exception:
-                pass
+# ----------------------------
+# 수집기(사이트별)
+# ----------------------------
 
-
-def hapakristin_page_seems_ok(page, event_id: int) -> bool:
-    """
-    하파크리스틴 이벤트 상세 페이지가 '정상 로딩'인지 휴리스틱 검사.
-    status None 오탐 방지 목적:
-    - 에러 문자열 검사 같은 넓은 조건을 쓰지 않고, 정상 페이지 메타/URL을 확인
-    """
-    want = f"/events/{event_id}"
-
-    ok_count = 0
-
-    try:
-        if want in (page.url or ""):
-            ok_count += 1
-    except Exception:
-        pass
-
-    try:
-        canon = page.locator('link[rel="canonical"]').first.get_attribute("href") or ""
-        if want in canon:
-            ok_count += 1
-    except Exception:
-        pass
-
-    try:
-        ogurl = page.locator('meta[property="og:url"]').first.get_attribute("content") or ""
-        if want in ogurl:
-            ok_count += 1
-    except Exception:
-        pass
-
-    try:
-        ogt = page.locator('meta[property="og:title"]').first.get_attribute("content") or ""
-        if (ogt or "").strip():
-            ok_count += 1
-    except Exception:
-        pass
-
-    try:
-        title = (page.title() or "").strip()
-        if title:
-            ok_count += 1
-    except Exception:
-        pass
-
-    # 3개 중 2개 이상이면 정상으로 간주(너무 빡세지 않게)
-    return ok_count >= 2
-
-
-# =========================
-# 공용 수집기
-# =========================
-def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
-                            exclude_patterns: list[str] | None = None,
-                            max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
-    exclude_patterns = exclude_patterns or []
-    safe_goto(page, list_url, "list")
-    try_close_common_popups(page)
-
-    anchors = page.locator("a[href]").all()
-    base = page.url
-    results = []
-
-    for a in anchors:
-        href = a.get_attribute("href") or ""
-        url = _abs_url(base, href)
-        if not url:
-            continue
-
-        if include_patterns and not any(re.search(p, url) for p in include_patterns):
-            continue
-        if exclude_patterns and any(re.search(p, url) for p in exclude_patterns):
-            continue
-
-        title = (a.inner_text() or "").strip()
-        if not title:
-            try:
-                img = a.locator("img").first
-                title = (img.get_attribute("alt") or "").strip()
-            except Exception:
-                title = ""
-
-        results.append({"key": url, "url": url, "title": title})
-        if len(results) >= max_items:
-            break
-
-    results = _dedup_keep_order(results)
-    print("[list] found:", len(results))
-    if not results:
-        _save_debug(page, "list_no_results")
-    return results
-
-
-def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
-                                      restrict_same_host: bool = True) -> list[dict]:
-    safe_goto(page, home_url, "home")
-    try_close_common_popups(page)
-    page.wait_for_timeout(2000)
-
-    base = page.url
-    selectors = [
-        "div[class*='banner'] a:has(img)",
-        "div[class*='swiper'] a:has(img)",
-        "div[class*='slick'] a:has(img)",
-        "section a:has(img)",
-        "a:has(img)",
-    ]
-
-    results, seen = [], set()
-    for sel in selectors:
-        anchors = page.locator(sel).all()
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            url = _abs_url(base, href)
-            if not url:
-                continue
-            if restrict_same_host and not _same_host(base, url):
-                continue
-            if url in seen:
-                continue
-
-            title = ""
-            try:
-                img = a.locator("img").first
-                title = (img.get_attribute("alt") or "").strip()
-            except Exception:
-                title = ""
-
-            results.append({"key": url, "url": url, "title": title})
-            seen.add(url)
-            if len(results) >= max_items:
-                break
-        if len(results) >= max_items:
-            break
-
-    results = _dedup_keep_order(results)
-    print("[banner] found:", len(results))
-    if not results:
-        _save_debug(page, "banner_no_results")
-    return results
-
-
-# =========================
-# 사이트별
-# =========================
-def scrape_olens(page) -> list[dict]:
+def scrape_olens(page) -> List[Item]:
+    site_key = "olens"
+    site_name = "오렌즈"
     url = "https://o-lens.com/event/list"
-    safe_goto(page, url, "olens")
 
-    cards = page.locator("div.board-information__wrapper")
-    try:
-        cards.first.wait_for(timeout=25_000)
-    except PlaywrightTimeoutError:
-        _save_debug(page, "olens_list_timeout")
-        return []
+    safe_goto(page, url, "olens_list")
+    page.wait_for_timeout(1200)
 
-    total = cards.count()
-    n = min(total, 15)
-    print("[olens] cards:", total, "use:", n)
-
-    results = []
-    for i in range(n):
-        card = cards.nth(i)
-        title = ""
-        try:
-            title = (card.locator(".board-information__title").first.inner_text() or "").strip()
-        except Exception:
-            title = ""
-
-        detail_url = ""
-        try:
-            card.click(timeout=10_000)
-            page.wait_for_url(re.compile(r".*/event/view/.*"), timeout=25_000)
-            detail_url = page.url
-        except PlaywrightTimeoutError:
-            _save_debug(page, f"olens_detail_timeout_{i+1}")
-        finally:
-            if "/event/view/" in page.url:
-                try:
-                    page.go_back(wait_until="domcontentloaded", timeout=30_000)
-                    page.locator("div.board-information__wrapper").first.wait_for(timeout=20_000)
-                except Exception:
-                    safe_goto(page, url, "olens_back")
-
-        if detail_url:
-            results.append({"key": detail_url, "url": detail_url, "title": title})
-
-    return _dedup_keep_order(results)
-
-
-def _event_id_from_url(u: str) -> int:
-    m = re.search(r"/events/(\d+)", u)
-    return int(m.group(1)) if m else 0
-
-
-def _hapakristin_try_open_ongoing(page) -> bool:
-    try:
-        candidates = page.locator("header, nav").locator("a, button").filter(has_text=re.compile("이벤트"))
-        n = min(candidates.count(), 6)
-        if n == 0:
-            return False
-
-        for i in range(n):
-            try:
-                candidates.nth(i).hover(timeout=6_000)
-                page.wait_for_timeout(600)
-                sub = page.locator("text=진행 중인 이벤트")
-                if sub.count() > 0:
-                    sub.first.click(timeout=6_000)
-                    page.wait_for_load_state("domcontentloaded", timeout=20_000)
-                    page.wait_for_timeout(1000)
-                    return True
-            except Exception:
-                continue
-
-        return False
-    except Exception:
-        return False
-
-
-def _hapakristin_collect_header_event_ids(page) -> list[str]:
-    hrefs = page.evaluate(
-        """() => {
-            const roots = Array.from(document.querySelectorAll('header, nav'));
-            const out = [];
-            for (const r of roots){
-              for (const a of Array.from(r.querySelectorAll('a[href]'))){
-                out.push({href: a.getAttribute('href') || '', text: (a.innerText || '').trim()});
-              }
-            }
-            return out;
-        }"""
-    )
-    base = page.url
-    urls = []
-    for row in hrefs:
-        h = (row.get("href") or "").strip()
-        t = (row.get("text") or "").strip()
-        if not h:
+    items: List[Item] = []
+    # 카드/리스트 내 링크 수집
+    anchors = page.query_selector_all("a[href]")
+    for a in anchors:
+        href = a.get_attribute("href") or ""
+        full = abs_url("https://o-lens.com", href)
+        if "/event/" not in full and "/event" not in full:
             continue
-        absu = _abs_url(base, h)
-        if not absu or not _same_host(base, absu):
+        t = a.inner_text() or ""
+        t = norm_text(t)
+        if not t:
             continue
-        if not re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
-            continue
-        if t in ("이벤트", "EVENT", ""):
-            continue
-        urls.append(absu.rstrip("/"))
+        items.append(make_item(site_key, site_name, t, full))
 
-    urls = list(dict.fromkeys(urls))
-    urls.sort(key=_event_id_from_url, reverse=True)
-    return urls[:10]
+    # 중복 제거
+    uniq = {}
+    for it in items:
+        uniq[it.item_id] = it
+    return list(uniq.values())
 
-
-def scrape_hapakristin(page) -> list[dict]:
-    safe_goto(page, "https://hapakristin.co.kr/", "hapakristin_home")
-    try_close_common_popups(page)
+def scrape_list_page(page, site_key: str, site_name: str, list_url: str, base: str, allow_patterns: List[str]) -> List[Item]:
+    safe_goto(page, list_url, "list")
     page.wait_for_timeout(1000)
 
-    if _hapakristin_try_open_ongoing(page):
-        event_urls = _hapakristin_collect_header_event_ids(page)
-        if event_urls:
-            print("[hapakristin] collected ids:", [_event_id_from_url(u) for u in event_urls])
-            results = [{"key": u, "url": u, "title": f"이벤트 {_event_id_from_url(u)}"} for u in event_urls]
-            print("[hapakristin] events found:", len(results))
-            return results
-
-    fixed = [
-        "https://hapakristin.co.kr/events/6824",
-        "https://hapakristin.co.kr/events/6724",
-    ]
-
-    bad = []
-    for u in fixed:
-        eid = _event_id_from_url(u)
-        st = safe_goto(page, u, f"hapakristin_check_{eid}")
-
-        # status가 명확히 4xx/5xx면 실패
-        if st is not None and st >= 400:
-            bad.append((u, st, "http_status"))
-            continue
-
-        # status가 None이어도, 정상 페이지 특징이 안 보이면 실패로 간주
-        if not hapakristin_page_seems_ok(page, eid):
-            bad.append((u, st, "content_check_failed"))
-
-    if bad:
-        _save_debug(page, "hapakristin_fixed_url_bad")
-        _save_debug_text(
-            "hapakristin_fixed_url_bad_info",
-            "\n".join([f"{u} status={st} reason={why}" for u, st, why in bad]),
-        )
-
-    print("[hapakristin] fallback fixed ids:", [_event_id_from_url(u) for u in fixed])
-    results = [{"key": u, "url": u, "title": f"이벤트 {_event_id_from_url(u)}"} for u in fixed]
-    print("[hapakristin] events found:", len(results))
-    return results
-
-
-def scrape_lensme(page) -> list[dict]:
-    return scrape_list_page_anchors(
-        page,
-        list_url="https://www.lens-me.com/shop/board.php?ps_bbscuid=17",
-        include_patterns=[r"ps_mode=view", r"ps_uid=\d+"],
-    )
-
-
-def scrape_i_sha(page) -> list[dict]:
-    return scrape_list_page_anchors(
-        page,
-        list_url="https://i-sha.kr/board/%EC%9D%B4%EB%B2%A4%ED%8A%B8/8/",
-        include_patterns=[r"i-sha\.kr/board/"],
-        exclude_patterns=[r"/page/\d+/?$"],
-    )
-
-
-def scrape_lenbling(page) -> list[dict]:
-    return scrape_list_page_anchors(
-        page,
-        list_url="https://lenbling.com/board/event/8/",
-        include_patterns=[r"lenbling\.com/board/event/"],
-        exclude_patterns=[r"/board/event/8/?$"],
-    )
-
-
-def scrape_yourly(page) -> list[dict]:
-    return scrape_list_page_anchors(
-        page,
-        list_url="https://yourly.kr/board/event",
-        include_patterns=[r"yourly\.kr/board/event"],
-        exclude_patterns=[r"/board/event/?$"],
-    )
-
-
-def scrape_i_dol(page) -> list[dict]:
-    return scrape_list_page_anchors(
-        page,
-        list_url="https://www.i-dol.kr/bbs/event1.php",
-        include_patterns=[r"i-dol\.kr/bbs/"],
-    )
-
-
-def scrape_myfipn(page) -> list[dict]:
-    return scrape_main_banners_by_image_links(page, "https://www.myfipn.com/")
-
-
-def scrape_chuulens(page) -> list[dict]:
-    return scrape_main_banners_by_image_links(page, "https://chuulens.kr/")
-
-
-def scrape_gemhour(page) -> list[dict]:
-    return scrape_main_banners_by_image_links(page, "https://gemhour.co.kr/")
-
-
-def scrape_shop_winc(page) -> list[dict]:
-    home = "https://shop.winc.app/"
-    safe_goto(page, home, "winc_home")
-    page.wait_for_timeout(2000)
-
-    anchors = page.locator("a[href]").all()
-    results, seen = [], set()
+    anchors = page.query_selector_all("a[href]")
+    items: List[Item] = []
 
     for a in anchors:
         href = a.get_attribute("href") or ""
-        url = _abs_url(page.url, href)
-        if not url:
+        full = abs_url(base, href)
+        if not full:
             continue
-        if not _same_host(page.url, url):
-            continue
-
-        m = re.search(r"/event/(\d+)", url)
-        if not m:
-            continue
-        if url in seen:
+        ok = any((re.search(p, full) is not None) for p in allow_patterns)
+        if not ok:
             continue
 
-        title = (a.inner_text() or "").strip() or f"event/{m.group(1)}"
-        key = f"winc:event:{m.group(1)}"
-        results.append({"key": key, "url": url, "title": title})
-        seen.add(url)
-        if len(results) >= DEFAULT_MAX_ITEMS:
-            break
-
-    results = _dedup_keep_order(results)
-    print("[winc] events:", len(results))
-    if not results:
-        _save_debug(page, "winc_no_event_links")
-        results = [{"key": "winc:home", "url": home, "title": "이벤트(홈)"}]
-    return results
-
-
-def _extract_codes_from_strings(strings: list[str]) -> list[str]:
-    codes = []
-    for s in strings:
-        if not s:
+        title = a.inner_text() or ""
+        title = norm_text(title)
+        if not title:
+            # 이미지 링크인 경우 aria-label/alt 일부 추출 시도
+            aria = a.get_attribute("aria-label") or ""
+            title = norm_text(aria)
+        if not title:
             continue
-        s = str(s)
 
-        for m in re.findall(r"contact_event\.php\?code=([^&\"'\s]+)", s):
-            if m and m != "$code":
-                codes.append(m)
+        items.append(make_item(site_key, site_name, title, full))
 
-        for m in re.findall(r"[?&]code=([^&\"'\s]+)", s):
-            if m and m != "$code":
-                codes.append(m)
+    uniq = {}
+    for it in items:
+        uniq[it.item_id] = it
+    print(f"[list] found: {len(uniq)}")
+    return list(uniq.values())
 
-        for m in re.findall(r"code\s*[:=]\s*['\"]([^'\"]+)['\"]", s):
-            if m and m != "$code":
-                codes.append(m)
+def scrape_banner(page, site_key: str, site_name: str, home_url: str, base: str, allow_patterns: List[str]) -> List[Item]:
+    safe_goto(page, home_url, "banner")
+    page.wait_for_timeout(1500)
 
-    out, seen = [], set()
-    for c in codes:
-        c = c.strip()
-        if len(c) < 2:
+    items: List[Item] = []
+    # 배너는 보통 a 또는 swiper-slide 내부 a
+    anchors = page.query_selector_all("a[href]")
+    for a in anchors:
+        href = a.get_attribute("href") or ""
+        full = abs_url(base, href)
+        if not full:
             continue
-        if c not in seen:
-            out.append(c)
-            seen.add(c)
-    return out
+        ok = any((re.search(p, full) is not None) for p in allow_patterns)
+        if not ok:
+            continue
 
+        # 배너는 텍스트가 없을 수 있으니 alt/aria-label 우선
+        title = a.get_attribute("aria-label") or ""
+        if not title:
+            img = a.query_selector("img[alt]")
+            if img:
+                title = img.get_attribute("alt") or ""
+        if not title:
+            title = a.inner_text() or ""
+        title = norm_text(title) or "(배너)"
 
-def scrape_ann365(page) -> list[dict]:
-    base_list = "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg="
-    max_pages = 15
-    max_items = 40
+        items.append(make_item(site_key, site_name, title, full))
 
-    results = []
-    seen_codes = set()
+    uniq = {}
+    for it in items:
+        uniq[it.item_id] = it
+    print(f"[banner] found: {len(uniq)}")
+    return list(uniq.values())
+
+def hapakristin_event_page_looks_ok(page) -> bool:
+    """
+    하파크리스틴은 Playwright에서 status가 404로 찍혀도 SPA 쉘이 로드되는 경우가 있습니다.
+    따라서 status만으로 실패 처리하지 않고, 페이지 정황을 보고 “정상 로드”를 판단합니다.
+    """
+    try:
+        title = page.title() or ""
+        url = page.url or ""
+        html = page.content() or ""
+    except Exception:
+        return False
+
+    title_ok = ("이벤트 페이지" in title) or ("Hapa Kristin" in title)
+    url_ok = ("/events/" in url)
+    app_ok = ('id="app"' in html) or ('id="app"' in html.lower())
+    # 이벤트 페이지는 보통 /events/<id>로 유지되고, app root가 존재
+    return (title_ok and url_ok and app_ok)
+
+def scrape_hapakristin(page) -> Tuple[List[Item], bool]:
+    """
+    반환: (items, had_hard_failure)
+    - 하드 실패: 고정 URL도 못 모으거나(0개), 페이지 로딩이 아예 깨진 경우
+    - 메뉴 탐색 실패는 fallback이 성공하면 하드 실패로 보지 않음(=경고 억제)
+    """
+    site_key = "hapakristin"
+    site_name = "하파크리스틴"
+    home = "https://hapakristin.co.kr/"
+
+    safe_goto(page, home, "hapakristin_home")
+    page.wait_for_timeout(1500)
+
+    # 1) 우선 고정 URL 2개를 기준으로 “진짜 진행중 이벤트”를 확보
+    fixed_ids = HAPAKRISTIN_FIXED_EVENT_IDS[:]
+    fixed_urls = [f"https://hapakristin.co.kr/events/{i}" for i in fixed_ids]
+
+    fixed_ok = True
+    fixed_items: List[Item] = []
+    # 이벤트 페이지 접근은 “상태코드”가 아니라 “페이지 정황”으로 OK 판단
+    for i, u in zip(fixed_ids, fixed_urls):
+        resp = safe_goto(page, u, f"hapakristin_check_{i}")
+        page.wait_for_timeout(1000)
+        if not hapakristin_event_page_looks_ok(page):
+            fixed_ok = False
+
+        # 제목은 페이지 내부에서 안정적으로 뽑기 어려울 수 있어, ID 기반 타이틀로
+        fixed_items.append(make_item(site_key, site_name, f"이벤트 {i}", u))
+
+    if fixed_ok:
+        # 고정 URL 기준 수집 성공이면, 불필요한 debug를 만들지 않고 바로 반환
+        print(f"[hapakristin] fallback fixed ids: {fixed_ids}")
+        print(f"[hapakristin] events found: {len(fixed_items)}")
+        return (fixed_items, False)
+
+    # 2) 고정 URL이 “정황상 실패”로 보이면, 그때만 추가 진단/디버그
+    #    (이 경우에만 debug 생성 + 테스트 채널 경고 대상)
+    html_fn, png_fn = save_debug_html_png(page, "hapakristin_fixed_url_bad")
+    info = []
+    for u in fixed_urls:
+        try:
+            r = page.goto(u, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            status = r.status if r else None
+            info.append(f"{u} status={status}")
+        except Exception as e:
+            info.append(f"{u} exception={e}")
+    info_fn = save_debug_text("hapakristin_fixed_url_bad_info", "\n".join(info))
+
+    print(f"[hapakristin] fallback fixed ids: {fixed_ids}")
+    print(f"[hapakristin] events found: {len(fixed_items)}")
+
+    # 고정 URL 자체는 아이템으로 반환(신규 감지 목적), 다만 하드 실패로 플래그
+    # - 고정 2개라도 반환되므로 신규 알림은 정상 동작
+    # - 대신 경고는 “새 debug 생성” 기준으로만 1회 발송
+    return (fixed_items, True)
+
+def scrape_lensme(page) -> List[Item]:
+    return scrape_list_page(
+        page=page,
+        site_key="lensme",
+        site_name="렌즈미",
+        list_url="https://www.lens-me.com/shop/board.php?ps_bbscuid=17",
+        base="https://www.lens-me.com",
+        allow_patterns=[r"/shop/board\.php\?ps_bbscuid=17", r"/shop/board\.php\?ps_bbspuid="],
+    )
+
+def scrape_myfipn(page) -> List[Item]:
+    return scrape_banner(
+        page=page,
+        site_key="myfipn",
+        site_name="마이핍앤",
+        home_url="https://www.myfipn.com/",
+        base="https://www.myfipn.com",
+        allow_patterns=[r"/event", r"/promotion", r"/board", r"/pages", r"/collections", r"/product", r"/products"],
+    )
+
+def scrape_chuulens(page) -> List[Item]:
+    return scrape_banner(
+        page=page,
+        site_key="chuulens",
+        site_name="츄렌즈",
+        home_url="https://chuulens.kr/",
+        base="https://chuulens.kr",
+        allow_patterns=[r"/event", r"/promotion", r"/board", r"/product", r"/products"],
+    )
+
+def scrape_gemhour(page) -> List[Item]:
+    return scrape_banner(
+        page=page,
+        site_key="gemhour",
+        site_name="젬아워",
+        home_url="https://gemhour.co.kr/",
+        base="https://gemhour.co.kr",
+        allow_patterns=[r"/event", r"/promotion", r"/board", r"/product", r"/products"],
+    )
+
+def scrape_isha(page) -> List[Item]:
+    return scrape_list_page(
+        page=page,
+        site_key="isha",
+        site_name="아이샤",
+        list_url="https://i-sha.kr/board/%EC%9D%B4%EB%B2%A4%ED%8A%B8/8/",
+        base="https://i-sha.kr",
+        allow_patterns=[r"/board/", r"/article/", r"/product/"],
+    )
+
+def scrape_lenbling(page) -> List[Item]:
+    return scrape_list_page(
+        page=page,
+        site_key="lenbling",
+        site_name="렌블링",
+        list_url="https://lenbling.com/board/event/8/",
+        base="https://lenbling.com",
+        allow_patterns=[r"/board/event/", r"/article/", r"/product/"],
+    )
+
+def scrape_yourly(page) -> List[Item]:
+    return scrape_list_page(
+        page=page,
+        site_key="yourly",
+        site_name="유어리",
+        list_url="https://yourly.kr/board/event",
+        base="https://yourly.kr",
+        allow_patterns=[r"/board/event", r"/article/", r"/product/"],
+    )
+
+def scrape_idol(page) -> List[Item]:
+    # i-dol -> 아이돌렌즈
+    return scrape_list_page(
+        page=page,
+        site_key="idol",
+        site_name="아이돌렌즈",
+        list_url="https://www.i-dol.kr/bbs/event1.php",
+        base="https://www.i-dol.kr",
+        allow_patterns=[r"/bbs/event", r"/bbs/board", r"/shop/item", r"/product"],
+    )
+
+def scrape_ann365(page) -> Tuple[List[Item], bool]:
+    """
+    ann365: 이벤트 모음 페이지
+    - code는 알 수 없으니, 리스트에서 실제 event 링크를 수집(상대/절대 모두)
+    - 여러 페이지 순회하되, 연속 empty 페이지가 나오면 중단
+    반환: (items, had_hard_failure)
+    """
+    site_key = "ann365"
+    site_name = "앤365"
+    base = "https://ann365.com"
+    list_tpl = "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg={pg}"
+
+    items: List[Item] = []
     empty_streak = 0
+    max_pages = 20  # 안전장치
 
     for pg in range(1, max_pages + 1):
-        list_url = f"{base_list}{pg}"
-        safe_goto(page, list_url, "ann365_list")
-        try_close_common_popups(page)
+        url = list_tpl.format(pg=pg)
+        safe_goto(page, url, "ann365_list")
         page.wait_for_timeout(900)
 
-        collected_strings = []
-        try:
-            collected_strings += page.evaluate(
-                """() => {
-                    const out = [];
-                    const els = Array.from(document.querySelectorAll('a, button, [onclick], [data-href], [data-url], [data-code]'));
-                    for (const el of els){
-                      out.push(el.getAttribute('href') || '');
-                      out.push(el.getAttribute('onclick') || '');
-                      out.push(el.getAttribute('data-href') || '');
-                      out.push(el.getAttribute('data-url') || '');
-                      out.push(el.getAttribute('data-code') || '');
-                    }
-                    const scripts = Array.from(document.querySelectorAll('script'));
-                    for (const s of scripts){
-                      const t = s.innerText || '';
-                      if (t && t.length < 200000) out.push(t);
-                    }
-                    return out;
-                }"""
-            )
-        except Exception:
-            pass
+        # 링크 수집(이벤트 상세는 code 파라미터 또는 별도 링크일 수 있음)
+        anchors = page.query_selector_all("a[href]")
+        found_this_page = 0
 
-        codes_this_page = _extract_codes_from_strings(collected_strings)
+        for a in anchors:
+            href = a.get_attribute("href") or ""
+            full = abs_url(base, href)
 
-        if not codes_this_page:
+            # 이벤트/프로모션 관련 링크만(너무 넓히면 잡음이 많아짐)
+            if not full:
+                continue
+            if ("contact_event" not in full) and ("event" not in full):
+                continue
+
+            title = a.inner_text() or ""
+            title = norm_text(title)
+            if not title:
+                continue
+
+            it = make_item(site_key, site_name, title, full)
+            items.append(it)
+            found_this_page += 1
+
+        if found_this_page == 0:
             empty_streak += 1
-            if pg == 1:
-                _save_debug(page, "ann365_no_codes_page1")
+            # 2페이지 연속으로 비면 끝으로 간주
             if empty_streak >= 2:
                 break
-            continue
         else:
             empty_streak = 0
 
-        new_added = 0
-        for code in codes_this_page:
-            if code in seen_codes:
-                continue
-            seen_codes.add(code)
-            detail_url = f"https://ann365.com/contact/contact_event.php?code={code}&scategory=&pg="
-            results.append({"key": f"ann365:code:{code}", "url": detail_url, "title": f"이벤트 {code}"})
-            new_added += 1
-            if len(results) >= max_items:
-                break
+    # 중복 제거
+    uniq = {}
+    for it in items:
+        uniq[it.item_id] = it
+    items = list(uniq.values())
 
-        if new_added == 0:
-            empty_streak += 1
-            if empty_streak >= 2:
-                break
+    if len(items) == 0:
+        # 진짜로 못 긁은 경우에만 debug + 하드 실패
+        html_fn, png_fn = save_debug_html_png(page, "ann365_no_results")
+        return (items, True)
 
-        if len(results) >= max_items:
-            break
-
-    results = _dedup_keep_order(results)
-    print("[ann365] events found:", len(results))
-    if not results:
-        _save_debug(page, "ann365_no_results")
-    return results
+    print(f"[ann365] events found: {len(items)}")
+    return (items, False)
 
 
-SITES = [
-    {"site": "O-Lens", "display": "오렌즈", "mode": "normal", "fn": scrape_olens},
-    {"site": "Hapa Kristin", "display": "하파크리스틴", "mode": "desktop", "fn": scrape_hapakristin},
-    {"site": "Lens-me", "display": "렌즈미", "mode": "normal", "fn": scrape_lensme},
-    {"site": "MYFiPN", "display": "마이핍앤", "mode": "normal", "fn": scrape_myfipn},
-    {"site": "CHUU Lens", "display": "츄렌즈", "mode": "normal", "fn": scrape_chuulens},
-    {"site": "Gemhour", "display": "젬아워", "mode": "normal", "fn": scrape_gemhour},
-    {"site": "i-sha", "display": "아이샤", "mode": "normal", "fn": scrape_i_sha},
-    {"site": "shop.winc.app", "display": "윙크", "mode": "normal", "fn": scrape_shop_winc},
-    {"site": "ann365", "display": "앤365", "mode": "normal", "fn": scrape_ann365},
-    {"site": "lenbling", "display": "렌블링", "mode": "normal", "fn": scrape_lenbling},
-    {"site": "yourly", "display": "유얼리", "mode": "normal", "fn": scrape_yourly},
-    {"site": "i-dol", "display": "아이돌렌즈", "mode": "normal", "fn": scrape_i_dol},
-]
+# ----------------------------
+# 메인 실행
+# ----------------------------
 
+def format_new_items_message(new_items: List[Item]) -> str:
+    # 운영 채널: 신규만
+    # 사이트별로 묶어서 보기 좋게
+    by_site: Dict[str, List[Item]] = {}
+    for it in new_items:
+        by_site.setdefault(it.site_name, []).append(it)
+
+    lines = []
+    lines.append(f"[신규 프로모션 감지] {now_kst_str()}")
+    if RUN_URL:
+        lines.append(f"Run: {RUN_URL}")
+
+    for site_name, items in by_site.items():
+        lines.append("")
+        lines.append(f"- {site_name} ({len(items)}건)")
+        for it in items[:20]:
+            # 너무 길면 슬랙 가독성 저하
+            title = it.title
+            if len(title) > 80:
+                title = title[:77] + "..."
+            lines.append(f"  • {title} | {it.url}")
+
+        if len(items) > 20:
+            lines.append(f"  … 외 {len(items)-20}건")
+
+    return "\n".join(lines)
+
+def format_debug_warning(site_name: str, new_debug_files: List[str]) -> str:
+    lines = []
+    lines.append(f"[수집 경고] {site_name}")
+    lines.append("debug 파일이 새로 생성되었습니다(수집 실패/구조 변경 가능).")
+    lines.append("새 debug: " + ", ".join(new_debug_files[:15]))
+    if RUN_URL:
+        lines.append(f"Run: {RUN_URL}")
+    return "\n".join(lines)
 
 def main():
-    state = load_state()
-    if "seen" not in state:
-        state["seen"] = {}
+    ensure_dirs()
 
-    any_state_changed = False
+    seen = load_json(SEEN_FILE, {})
+    # 구조: { site_key: { item_id: {title,url,first_seen} } }
+    if not isinstance(seen, dict):
+        seen = {}
+
+    debug_notified: Set[str] = set(load_json(DEBUG_NOTIFIED_FILE, []))
+    if not isinstance(debug_notified, set):
+        debug_notified = set(debug_notified) if isinstance(debug_notified, list) else set()
+
+    debug_before = set(list_debug_files())
+
+    new_items_all: List[Item] = []
+    had_any_state_change = False
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        context = browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
         )
+        page = context.new_page()
+        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
 
-        for cfg in SITES:
-            site_key = cfg["site"]
-            site_name = cfg["display"]
-            mode = cfg["mode"]
-            fn = cfg["fn"]
+        sites = [
+            ("olens", "오렌즈", lambda: scrape_olens(page)),
+            ("hapakristin", "하파크리스틴", None),  # 특별 처리
+            ("lensme", "렌즈미", lambda: scrape_lensme(page)),
+            ("myfipn", "마이핍앤", lambda: scrape_myfipn(page)),
+            ("chuulens", "츄렌즈", lambda: scrape_chuulens(page)),
+            ("gemhour", "젬아워", lambda: scrape_gemhour(page)),
+            ("isha", "아이샤", lambda: scrape_isha(page)),
+            ("lenbling", "렌블링", lambda: scrape_lenbling(page)),
+            ("yourly", "유어리", lambda: scrape_yourly(page)),
+            ("idol", "아이돌렌즈", lambda: scrape_idol(page)),
+            ("ann365", "앤365", None),  # 특별 처리
+        ]
 
-            print("\n[main] site:", site_key, "(", site_name, ")")
+        for site_key, site_name, fn in sites:
+            print(f"[main] site: {site_name} ( {site_name} )")
 
-            debug_before = _list_debug_files()
-
-            start = time.time()
-            context = None
-            page = None
-            items = []
-            site_exception = ""
+            t0 = time.time()
+            items: List[Item] = []
+            hard_fail = False
 
             try:
-                if mode == "desktop":
-                    context, page = new_page(browser, viewport_w=1400, viewport_h=900)
+                if site_key == "hapakristin":
+                    items, hard_fail = scrape_hapakristin(page)
+                elif site_key == "ann365":
+                    items, hard_fail = scrape_ann365(page)
                 else:
-                    context, page = new_page(browser, viewport_w=1200, viewport_h=800)
-
-                items = fn(page) or []
-                items = _dedup_keep_order(items)
-
+                    items = fn() if fn else []
+            except PWTimeoutError as e:
+                hard_fail = True
+                save_debug_text(f"{site_key}_timeout", str(e))
             except Exception as e:
-                site_exception = repr(e)
-                print("[main] site error:", site_key, site_exception)
-                if page is not None:
-                    _save_debug(page, f"error_{site_key.replace(' ', '_')}")
-                items = []
+                hard_fail = True
+                save_debug_text(f"{site_key}_exception", repr(e))
 
-            finally:
-                try:
-                    if context is not None:
-                        context.close()
-                except Exception:
-                    pass
+            elapsed = time.time() - t0
+            print(f"[main] scraped: {len(items)} elapsed={elapsed:.1f}s")
 
-            elapsed = time.time() - start
-            print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
+            # 신규 감지
+            site_seen = seen.get(site_key, {})
+            if not isinstance(site_seen, dict):
+                site_seen = {}
 
-            debug_after = _list_debug_files()
-            new_debug_files = debug_after - debug_before
+            new_this_site: List[Item] = []
+            for it in items:
+                if it.item_id not in site_seen:
+                    new_this_site.append(it)
+                    site_seen[it.item_id] = {
+                        "title": it.title,
+                        "url": it.url,
+                        "first_seen": now_kst_str(),
+                    }
 
-            if new_debug_files:
-                run_url = _run_url()
-                picked = _filter_site_debug_files(site_key, new_debug_files)[:8]
-                reason = "debug 파일이 새로 생성되었습니다(수집 실패/구조 변경 가능)."
-                if site_exception:
-                    reason = f"예외로 debug 생성: {site_exception}"
+            if new_this_site:
+                had_any_state_change = True
+                new_items_all.extend(new_this_site)
 
-                msg = (
-                    f"[수집 경고] {site_name}\n"
-                    f"{reason}\n"
-                    f"새 debug: {', '.join(picked)}\n"
-                    f"Run: {run_url}"
-                ).strip()
+            seen[site_key] = site_seen
+            print(f"[main] new: {len(new_this_site)}")
 
-                try:
-                    post_slack_test(msg)
-                except Exception as e:
-                    print("[main] test slack notify failed:", repr(e))
-
-            seen_set = set(state["seen"].get(site_key, []))
-
-            if INIT_SILENT and not seen_set and items:
-                for it in items:
-                    k = it.get("key")
-                    if k:
-                        seen_set.add(k)
-                state["seen"][site_key] = sorted(seen_set)
-                any_state_changed = True
-                print("[main] INIT_SILENT: initialized state only")
-                continue
-
-            new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
-            print("[main] new:", len(new_items))
-
-            if new_items:
-                for it in new_items[:10]:
-                    title = (it.get("title") or "").strip()
-                    url = it.get("url") or ""
-                    msg = f"[{site_name} 신규 프로모션]\n{title}\n{url}".strip()
-                    try:
-                        post_slack_prod(msg)
-                    except Exception as e:
-                        print("[main] prod slack failed:", repr(e))
-                    seen_set.add(it["key"])
-
-                state["seen"][site_key] = sorted(seen_set)
-                any_state_changed = True
+            # “하드 실패”만으로는 곧장 경고하지 않음.
+            # 경고는 “debug 파일이 새로 생성된 경우에만” 보내고,
+            # 그마저도 이미 보낸 debug 파일은 재전송하지 않음.
+            # (아래에서 일괄 처리)
 
         try:
+            context.close()
+        finally:
             browser.close()
-        except Exception:
-            pass
 
-    if any_state_changed:
-        save_state(state)
-        print("[main] state saved:", str(STATE_PATH))
-    else:
-        print("[main] no state changes")
+    # 상태 저장
+    save_json(SEEN_FILE, seen)
 
+    # 운영 채널: 신규만 알림
+    if new_items_all:
+        msg = format_new_items_message(new_items_all)
+        post_slack(OPS_WEBHOOK, msg)
+
+    # debug 경고: “새로 생성된 debug 파일”만 + “미통지 파일”만
+    debug_after = set(list_debug_files())
+    created = sorted(list(debug_after - debug_before))
+    created_unnotified = [f for f in created if f not in debug_notified]
+
+    # 사이트별로 debug 파일을 대충 매핑(파일명 prefix로)
+    # 예: hapakristin_*, ann365_*, list_no_results_* 등
+    if created_unnotified and TEST_WEBHOOK:
+        buckets: Dict[str, List[str]] = {}
+        for fn in created_unnotified:
+            low = fn.lower()
+            if low.startswith("hapakristin_"):
+                buckets.setdefault("하파크리스틴", []).append(fn)
+            elif low.startswith("ann365_"):
+                buckets.setdefault("앤365", []).append(fn)
+            elif low.startswith("olens_"):
+                buckets.setdefault("오렌즈", []).append(fn)
+            elif low.startswith("lensme_"):
+                buckets.setdefault("렌즈미", []).append(fn)
+            elif low.startswith("myfipn_"):
+                buckets.setdefault("마이핍앤", []).append(fn)
+            elif low.startswith("chuulens_"):
+                buckets.setdefault("츄렌즈", []).append(fn)
+            elif low.startswith("gemhour_"):
+                buckets.setdefault("젬아워", []).append(fn)
+            elif low.startswith("isha_"):
+                buckets.setdefault("아이샤", []).append(fn)
+            elif low.startswith("lenbling_"):
+                buckets.setdefault("렌블링", []).append(fn)
+            elif low.startswith("yourly_"):
+                buckets.setdefault("유어리", []).append(fn)
+            elif low.startswith("idol_"):
+                buckets.setdefault("아이돌렌즈", []).append(fn)
+            else:
+                buckets.setdefault("기타", []).append(fn)
+
+        for site_name, files in buckets.items():
+            post_slack(TEST_WEBHOOK, format_debug_warning(site_name, files))
+
+        # 통지 기록 업데이트
+        for fn in created_unnotified:
+            debug_notified.add(fn)
+        save_json(DEBUG_NOTIFIED_FILE, sorted(list(debug_notified)))
+
+    print("[main] done")
 
 if __name__ == "__main__":
     main()
