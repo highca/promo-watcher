@@ -1,5 +1,3 @@
-post_slack("[TEST] 워크플로 실행 확인")
-
 import os
 import re
 import json
