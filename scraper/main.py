@@ -24,6 +24,8 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# state 초기화(첫 실행 시 알림 안 보내고 상태만 저장) 모드
+# 이미 state가 쌓여있으면 False 유지 권장
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
@@ -90,14 +92,11 @@ def _list_debug_files() -> set[str]:
 
 
 def _filter_site_debug_files(site_key: str, files: set[str]) -> list[str]:
-    # debug prefix에 site_key가 들어가는 경우를 우선적으로 추출
     safe = re.sub(r"[^0-9A-Za-z가-힣]+", "_", site_key).strip("_")
     picked = []
     for f in sorted(files):
-        if safe in f:
+        if safe and safe in f:
             picked.append(f)
-    # site_key가 파일명에 안 들어가도 error_/list_no_results 같은 공용 파일이 생성될 수 있으니
-    # 아무것도 못 찾으면 전체 새 파일명을 그대로 사용
     return picked if picked else sorted(files)
 
 
@@ -324,29 +323,39 @@ def scrape_olens(page) -> list[dict]:
     return _dedup_keep_order(results)
 
 
-def _hapakristin_find_event_list_url_from_home(page) -> str:
-    anchors = page.locator("a[href]").all()
-    base = page.url
+def _event_id_from_url(u: str) -> int:
+    m = re.search(r"/events/(\d+)", u)
+    return int(m.group(1)) if m else 0
 
-    candidates = []
-    for a in anchors:
-        href = a.get_attribute("href") or ""
-        url = _abs_url(base, href)
-        if not url:
-            continue
-        if not _same_host(base, url):
-            continue
 
-        if re.search(r"hapakristin\.co\.kr/events/\d+", url):
-            candidates.append(url)
-            continue
+def hapakristin_is_active_event(page, url: str) -> bool:
+    # 이벤트 페이지 접속 후 텍스트 기반으로 “종료/마감” 여부를 판별
+    safe_goto(page, url, "hapakristin_event_check")
+    try_close_common_popups(page)
+    page.wait_for_timeout(1200)
 
-        if re.search(r"hapakristin\.co\.kr/.{0,40}event", url, re.IGNORECASE):
-            candidates.append(url)
+    try:
+        text = (page.inner_text("body") or "").strip()
+    except Exception:
+        text = ""
 
-    candidates = list(dict.fromkeys(candidates))
-    candidates.sort(key=lambda x: (0 if re.search(r"/events/\d+", x) else 1, len(x)))
-    return candidates[0] if candidates else ""
+    closed_keywords = [
+        "종료", "마감", "종료된", "종료되었습니다", "이벤트 종료", "마감되었습니다"
+    ]
+    active_keywords = [
+        "진행 중", "진행중", "진행 중인 이벤트"
+    ]
+
+    if any(k in text for k in active_keywords):
+        if any(k in text for k in closed_keywords):
+            return False
+        return True
+
+    if any(k in text for k in closed_keywords):
+        return False
+
+    # 애매하면 일단 포함(필요 시 강화 가능)
+    return True
 
 
 def scrape_hapakristin(page) -> list[dict]:
@@ -355,10 +364,10 @@ def scrape_hapakristin(page) -> list[dict]:
     try_close_common_popups(page)
     page.wait_for_timeout(2000)
 
-    # 1) 홈에서 /events/<id> 링크만 수집
     base = page.url
     anchors = page.locator("a[href]").all()
 
+    # 1차: /events/<id> 링크만 수집
     event_urls = []
     for a in anchors:
         href = a.get_attribute("href") or ""
@@ -367,12 +376,10 @@ def scrape_hapakristin(page) -> list[dict]:
             continue
         if not _same_host(base, url):
             continue
-
         if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", url):
             event_urls.append(url.rstrip("/"))
 
-    # 2) 홈에서 못 찾으면, 알려진 이벤트 허브로 한 번 더 시도(구조 변경 대비)
-    #    (현재 사용자가 주신 6824 같은 페이지가 허브 역할일 가능성이 높음)
+    # 홈에서 못 찾으면 알려진 후보 페이지에서 한 번 더 수집
     if not event_urls:
         fallback_list_pages = [
             "https://hapakristin.co.kr/events/6824",
@@ -401,18 +408,23 @@ def scrape_hapakristin(page) -> list[dict]:
             except Exception:
                 pass
 
-    # 3) 정리 + 최대 개수 제한(너무 많이 쌓일 때 대비)
+    # 중복 제거 + 안정용 제한
     event_urls = list(dict.fromkeys(event_urls))
+    event_urls = event_urls[:20]
 
-    # (선택) 이벤트 id 큰 순으로 정렬: /events/6824 -> 6824
-    def _event_id(u: str) -> int:
-        m = re.search(r"/events/(\d+)", u)
-        return int(m.group(1)) if m else 0
+    # 2차: 각 이벤트 페이지에 들어가 “진행 중”만 남김
+    active_urls = []
+    for u in event_urls:
+        try:
+            if hapakristin_is_active_event(page, u):
+                active_urls.append(u)
+        except Exception:
+            _save_debug(page, "hapakristin_event_check_fail")
 
-    event_urls.sort(key=_event_id, reverse=True)
+    active_urls = list(dict.fromkeys(active_urls))
+    active_urls.sort(key=_event_id_from_url, reverse=True)
 
-    results = [{"key": u, "url": u, "title": f"이벤트 {_event_id(u)}"} for u in event_urls[:20]]
-
+    results = [{"key": u, "url": u, "title": f"이벤트 {_event_id_from_url(u)}"} for u in active_urls]
     print("[hapakristin] events found:", len(results))
     if not results:
         _save_debug(page, "hapakristin_events_no_results")
@@ -584,6 +596,7 @@ def main():
             site_exception = ""
 
             try:
+                # 하파크리스틴은 데스크톱 레이아웃을 강제(hover/레이아웃 영향을 줄이기 위해)
                 if mode == "desktop":
                     context, page = new_page(browser, viewport_w=1400, viewport_h=900)
                 else:
@@ -609,15 +622,13 @@ def main():
             elapsed = time.time() - start
             print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
-            # 사이트 실행 후 debug 파일 목록 비교 → 새 파일 있을 때만 경고
+            # 사이트 실행 후 debug 파일 목록 비교 → 새 파일 있을 때만 테스트 채널 경고
             debug_after = _list_debug_files()
             new_debug_files = debug_after - debug_before
 
             if new_debug_files:
                 run_url = _run_url()
-                picked = _filter_site_debug_files(site_key, new_debug_files)
-                # 너무 길면 8개만
-                picked = picked[:8]
+                picked = _filter_site_debug_files(site_key, new_debug_files)[:8]
                 reason = "debug 파일이 새로 생성되었습니다(수집 실패/구조 변경 가능)."
                 if site_exception:
                     reason = f"예외로 debug 생성: {site_exception}"
