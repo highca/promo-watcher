@@ -2,7 +2,7 @@ name: O-Lens Event Monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -35,18 +35,9 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Heartbeat (test)
-        if: always()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_TEST }}
-        run: |
-          payload=$(printf '{"text":"[TEST] heartbeat | event=%s | run=%s | time=%s"}' \
-            "$GITHUB_EVENT_NAME" "$GITHUB_RUN_NUMBER" "$(date -u '+%F %T UTC')")
-          curl -sS -X POST -H "Content-type: application/json" --data "$payload" "$SLACK_WEBHOOK_URL"
-
       - name: Run scraper
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_TEST }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
         run: |
           python scraper/main.py
 
@@ -63,6 +54,6 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add -A
-            git commit -m "Update olens state"
+            git commit -m "Update promo state"
             git push
           fi
