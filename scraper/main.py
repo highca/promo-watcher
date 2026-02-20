@@ -1,10 +1,19 @@
 # scraper/main.py
 # 신규만 운영채널 알림, debug 신규 생성 시에만 테스트채널 경고
 #
-# 변경 요약(반영 완료)
-# - 하파크리스틴: hover 실패는 "정상 fallback"으로 간주 → debug 생성 안 함(=테스트 채널 경고 안 감)
-#   단, 고정 URL(6824/6724)이 실제로 열리지 않거나(HTTP 4xx/5xx) 이상할 때만 debug 생성
-# - ann365: contact_event 허브 기반, 불필요한 페이지 순회 줄이기(연속 2페이지 무수집 시 중단)
+# 핵심 동작
+# - 운영 채널: "신규 프로모션"만 알림
+# - 테스트 채널: "debug 파일이 새로 생성된 경우에만" 경고 알림
+#
+# 주요 보완(하파크리스틴)
+# - hover 실패는 정상 fallback으로 취급 (debug 생성 X)
+# - 고정 URL(6824/6724) 체크 시:
+#   * HTTP status None은 정상일 수 있으므로 실패로 보지 않음
+#   * status >= 400 또는 페이지 내용이 명백히 에러(404/Not Found 등)일 때만 debug 생성
+#
+# ann365
+# - contact_event 허브 기반
+# - 연속 2페이지 무수집이면 조기 종료하여 실행 시간 단축
 
 import os
 import re
@@ -198,6 +207,28 @@ def try_close_common_popups(page):
                 page.wait_for_timeout(300)
             except Exception:
                 pass
+
+
+def page_looks_like_error(page) -> bool:
+    """
+    status를 못 받는(None) 케이스가 있어도
+    페이지 자체가 404/Not Found 등 명확한 에러 페이지면 실패로 간주하기 위한 휴리스틱
+    """
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    try:
+        html = (page.content() or "").lower()
+    except Exception:
+        html = ""
+
+    needles = ["404", "not found", "페이지를 찾을 수", "존재하지", "error", "접근할 수"]
+    if any(n in title for n in needles):
+        return True
+    if any(n in html for n in needles):
+        return True
+    return False
 
 
 # =========================
@@ -438,12 +469,19 @@ def scrape_hapakristin(page) -> list[dict]:
         "https://hapakristin.co.kr/events/6724",
     ]
 
-    # 고정 URL 자체가 깨졌을 때만 debug 생성
+    # 고정 URL 자체가 진짜로 깨졌을 때만 debug 생성
     bad = []
     for u in fixed:
         st = safe_goto(page, u, f"hapakristin_check_{_event_id_from_url(u)}")
-        if st is None or st >= 400:
+
+        # status를 못 받는(None) 케이스는 정상일 수 있으므로 실패로 보지 않음
+        if st is not None and st >= 400:
             bad.append((u, st))
+            continue
+
+        # status가 None이어도, 페이지가 명백히 에러 페이지면 실패로 간주
+        if st is None and page_looks_like_error(page):
+            bad.append((u, "unknown_but_error_page"))
 
     if bad:
         _save_debug(page, "hapakristin_fixed_url_bad")
