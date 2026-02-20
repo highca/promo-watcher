@@ -361,15 +361,41 @@ def scrape_i_dol(page) -> list[dict]:
 
 
 def scrape_shop_winc(page) -> list[dict]:
-    results = scrape_gnb_click_then_collect(
-        page,
-        home_url="https://shop.winc.app/",
-        menu_text="이벤트",
-        include_patterns=[r"shop\.winc\.app/.*(event|promotion|board|bbs)"],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
+    """
+    shop.winc.app:
+    Flutter Web이라 headless에서 화면이 하얗게 보이거나 메뉴 클릭이 실패할 수 있습니다.
+    대신 HTML에 SEO용으로 숨겨진 nav(display:none)에 이벤트 링크가 포함되어 있으므로,
+    /event/{id} 링크를 직접 수집합니다.
+    """
+    home = "https://shop.winc.app/"
+    safe_goto(page, home, "winc_home")
+
+    # DOM에 존재하는 이벤트 링크를 수집 (숨김 nav 포함)
+    anchors = page.locator('a[href^="/event/"]').all()
+    print("[winc] /event anchors:", len(anchors))
+
+    results = []
+    for a in anchors[:DEFAULT_MAX_ITEMS]:
+        href = a.get_attribute("href") or ""
+        if not href:
+            continue
+
+        url = _abs_url(page.url, href)  # 절대 URL로 변환
+        m = re.search(r"/event/(\d+)", url)
+        if not m:
+            continue
+
+        title = (a.inner_text() or "").strip()
+        if not title:
+            title = f"event/{m.group(1)}"
+
+        key = f"winc:event:{m.group(1)}"
+        results.append({"key": key, "url": url, "title": title})
+
+    results = _dedup_keep_order(results)
     if not results:
-        results = [{"key": page.url, "url": page.url, "title": "이벤트(메뉴 이동)"}]
+        _save_debug(page, "winc_no_event_links")
+
     return results
 
 
