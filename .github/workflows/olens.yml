@@ -2,7 +2,7 @@ name: O-Lens Event Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # 15분마다(UTC)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -36,6 +36,13 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python scraper/main.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
 
       - name: Commit state if changed
         run: |
