@@ -11,6 +11,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 SLACK_WEBHOOK_URL_PROD = os.environ.get("SLACK_WEBHOOK_URL_PROD", "").strip()
 SLACK_WEBHOOK_URL_TEST = os.environ.get("SLACK_WEBHOOK_URL_TEST", "").strip()
 
+# ann365 수동 fallback (예: "721,722")
+ANN365_FALLBACK_EVENT_IDS = os.environ.get("ANN365_FALLBACK_EVENT_IDS", "").strip()
+
 GITHUB_SERVER_URL = os.environ.get("GITHUB_SERVER_URL", "").strip()
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
 GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "").strip()
@@ -148,14 +151,7 @@ def new_page(browser, *, viewport_w=1200, viewport_h=800):
         timezone_id="Asia/Seoul",
         viewport={"width": viewport_w, "height": viewport_h},
     )
-
-    # headless 탐지 회피(가벼운 수준)
-    context.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """
-    )
-
+    context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
     page = context.new_page()
     page.set_default_timeout(ACTION_TIMEOUT_MS)
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
@@ -323,23 +319,13 @@ def _event_id_from_url(u: str) -> int:
 
 
 def _hapakristin_try_open_ongoing(page) -> bool:
-    """
-    hover로 하위 메뉴가 생성되는 경우를 최대한 커버:
-    - header/nav 영역에서 '이벤트'에 hover
-    - '진행 중인 이벤트' 클릭
-    """
     try:
-        # '이벤트' 후보를 넓게 잡고, 화면에 보이는(first) 것을 hover
         evt_candidates = page.locator("header, nav").locator("text=이벤트")
         if evt_candidates.count() == 0:
             return False
-
-        evt = evt_candidates.first
-        evt.hover(timeout=6_000)
+        evt_candidates.first.hover(timeout=6_000)
         page.wait_for_timeout(700)
-
-        ongoing = page.locator("text=진행 중인 이벤트").first
-        ongoing.click(timeout=6_000)
+        page.locator("text=진행 중인 이벤트").first.click(timeout=6_000)
         page.wait_for_load_state("domcontentloaded", timeout=20_000)
         page.wait_for_timeout(1200)
         return True
@@ -347,13 +333,56 @@ def _hapakristin_try_open_ongoing(page) -> bool:
         return False
 
 
+def _hapakristin_collect_from_ongoing_section(page) -> list[str]:
+    """
+    가장 안전한 방식:
+    '진행 중인 이벤트' 문구가 있는 섹션(부모 블록) 내부에서만 /events/<id> 링크를 수집
+    """
+    data = page.evaluate(
+        """() => {
+            const headings = Array.from(document.querySelectorAll('*'))
+              .filter(el => (el.innerText || '').trim() === '진행 중인 이벤트');
+
+            if (headings.length === 0) return [];
+
+            // 가장 가까운 섹션(부모) 찾기: section/div/article 중 하나로 6단계까지 상승
+            let h = headings[0];
+            let root = h;
+            for (let i=0; i<6; i++){
+              if (!root || !root.parentElement) break;
+              root = root.parentElement;
+              const tag = (root.tagName || '').toLowerCase();
+              if (tag === 'section' || tag === 'article' || tag === 'div') break;
+            }
+
+            const out = [];
+            const as = Array.from(root.querySelectorAll('a[href]'));
+            for (const a of as){
+              const href = a.getAttribute('href') || '';
+              out.push(href);
+            }
+            return out;
+        }"""
+    )
+
+    base = page.url
+    urls = []
+    for href in data:
+        absu = _abs_url(base, href)
+        if not absu or not _same_host(base, absu):
+            continue
+        if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
+            urls.append(absu.rstrip("/"))
+
+    urls = list(dict.fromkeys(urls))
+    urls.sort(key=_event_id_from_url, reverse=True)
+    return urls[:20]
+
+
 def _hapakristin_collect_event_links_strict(page) -> list[str]:
     """
-    하파크리스틴 오수집을 줄이기 위한 '강한' 수집:
-    - header/nav/footer 안 링크 제외
-    - 이전/다음 네비 링크 제외
-    - 이미지(img)를 포함한 a 태그만 우선 수집 (이벤트 배너/카드형)
-    - /events/<id> 링크만
+    섹션 기반 수집이 실패했을 때만 쓰는 보조(엄격) 수집:
+    header/nav/footer 제외 + 이미지 포함 링크 우선
     """
     data = page.evaluate(
         """() => {
@@ -361,27 +390,17 @@ def _hapakristin_collect_event_links_strict(page) -> list[str]:
             const anchors = Array.from(document.querySelectorAll('a[href]'));
             for (const a of anchors) {
               if (a.closest('header, nav, footer')) continue;
-
               const t = (a.innerText || '').trim();
               if (t.includes('이전') || t.includes('다음')) continue;
-
-              const cls = (a.className || '').toString().toLowerCase();
-              const aria = (a.getAttribute('aria-label') || '').toLowerCase();
-              if (cls.includes('prev') || cls.includes('next') || aria.includes('prev') || aria.includes('next')) continue;
-
-              // 이벤트 배너/카드 성격: 이미지 포함 링크 우선
               const hasImg = a.querySelector('img') !== null;
-              const href = a.getAttribute('href') || '';
-
-              out.push({href, hasImg});
+              out.push({href: a.getAttribute('href') || '', hasImg});
             }
             return out;
         }"""
     )
 
     base = page.url
-    img_urls = []
-    text_urls = []
+    img_urls, text_urls = [], []
 
     for row in data:
         href = (row.get("href") or "").strip()
@@ -392,15 +411,9 @@ def _hapakristin_collect_event_links_strict(page) -> list[str]:
             continue
         if not re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
             continue
+        (img_urls if row.get("hasImg") else text_urls).append(absu.rstrip("/"))
 
-        if row.get("hasImg"):
-            img_urls.append(absu.rstrip("/"))
-        else:
-            text_urls.append(absu.rstrip("/"))
-
-    # 이미지 포함 링크가 있으면 그것만 사용 (오수집 억제)
     urls = img_urls if img_urls else text_urls
-
     urls = list(dict.fromkeys(urls))
     urls.sort(key=_event_id_from_url, reverse=True)
     return urls[:20]
@@ -414,20 +427,23 @@ def scrape_hapakristin(page) -> list[dict]:
     ok = _hapakristin_try_open_ongoing(page)
     if not ok:
         _save_debug(page, "hapakristin_ongoing_menu_not_found")
-        # 사용자 확인된 진행중 이벤트 페이지로 fallback
         safe_goto(page, "https://hapakristin.co.kr/events/6824", "hapakristin_fallback_6824")
         try_close_common_popups(page)
         page.wait_for_timeout(1200)
 
-    # 1차: 현재 페이지에서 엄격 수집
-    event_urls = _hapakristin_collect_event_links_strict(page)
+    # 1순위: '진행 중인 이벤트' 섹션 내부에서만 수집
+    event_urls = _hapakristin_collect_from_ongoing_section(page)
 
-    # 2차: 그래도 0이면 6724에서 재시도
+    # 2순위: 섹션 수집이 실패하면 보조(엄격) 수집
+    if not event_urls:
+        event_urls = _hapakristin_collect_event_links_strict(page)
+
+    # 그래도 0이면 6724에서 재시도
     if not event_urls:
         safe_goto(page, "https://hapakristin.co.kr/events/6724", "hapakristin_fallback_6724")
         try_close_common_popups(page)
         page.wait_for_timeout(1200)
-        event_urls = _hapakristin_collect_event_links_strict(page)
+        event_urls = _hapakristin_collect_from_ongoing_section(page) or _hapakristin_collect_event_links_strict(page)
 
     if event_urls:
         print("[hapakristin] collected ids:", [_event_id_from_url(u) for u in event_urls])
@@ -544,11 +560,6 @@ def _requests_get(url: str) -> str:
     return r.text
 
 
-def _jina_proxy_url(url: str) -> str:
-    # 예: https://r.jina.ai/https://ann365.com/sub/menu.php
-    return "https://r.jina.ai/" + url
-
-
 def _extract_ann365_prd_event_ids(html: str) -> list[str]:
     ids = re.findall(r"prd_event=(\d+)", html)
     ids = list(dict.fromkeys(ids))
@@ -563,24 +574,24 @@ def _extract_ann365_prd_event_ids(html: str) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def _ann365_ids_from_env() -> list[str]:
+    if not ANN365_FALLBACK_EVENT_IDS:
+        return []
+    parts = [p.strip() for p in ANN365_FALLBACK_EVENT_IDS.split(",")]
+    return [p for p in parts if p.isdigit()]
+
+
 def scrape_ann365(page) -> list[dict]:
     menu_url = "https://ann365.com/sub/menu.php"
-    html = ""
 
-    # 1) requests
+    # A) menu.php 시도 (requests)
+    html = ""
     try:
         html = _requests_get(menu_url)
     except Exception as e:
         _save_debug_text("ann365_request_fail", f"{menu_url}\n{repr(e)}")
 
-    # 2) jina 프록시
-    if not html:
-        try:
-            html = _requests_get(_jina_proxy_url(menu_url))
-        except Exception as e:
-            _save_debug_text("ann365_jina_fail", f"{_jina_proxy_url(menu_url)}\n{repr(e)}")
-
-    # 3) playwright (networkidle)
+    # B) menu.php 시도 (playwright)
     if not html:
         try:
             safe_goto(page, menu_url, "ann365_menu_pw", wait="domcontentloaded")
@@ -594,17 +605,43 @@ def scrape_ann365(page) -> list[dict]:
         except Exception as e:
             _save_debug(page, "ann365_playwright_fail")
             _save_debug_text("ann365_playwright_fail_reason", f"{menu_url}\n{repr(e)}")
-            return []
+            html = ""
 
-    if not html or len(html.strip()) < 200:
-        _save_debug(page, "ann365_empty_html")
-        _save_debug_text("ann365_empty_html_info", f"len={len(html.strip())}")
-        return []
+    ids = _extract_ann365_prd_event_ids(html) if html else []
 
-    ids = _extract_ann365_prd_event_ids(html)
+    # C) 그래도 없으면 홈에서 prd_event 탐색
     if not ids:
-        _save_debug(page, "ann365_no_prd_event")
-        _save_debug_text("ann365_no_prd_event_snippet", html[:2000])
+        try:
+            safe_goto(page, "https://ann365.com/", "ann365_home_pw", wait="domcontentloaded")
+            try_close_common_popups(page)
+            page.wait_for_timeout(1500)
+
+            hrefs = page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href') || '')"""
+            )
+            base = page.url
+            urls = []
+            for h in hrefs:
+                absu = urljoin(base, (h or "").strip())
+                if "prd_event=" in absu:
+                    urls.append(absu)
+            ids = []
+            for u in urls:
+                mm = re.search(r"prd_event=(\\d+)", u)
+                if mm:
+                    ids.append(mm.group(1))
+            ids = list(dict.fromkeys(ids))
+        except Exception:
+            pass
+
+    # D) 최후: 환경변수 fallback
+    if not ids:
+        ids = _ann365_ids_from_env()
+
+    if not ids:
+        # 현재 상황(빈 HTML) 기록
+        _save_debug(page, "ann365_empty_html")
+        _save_debug_text("ann365_empty_html_info", f"menu_html_len={len((html or '').strip())}")
         return []
 
     results = []
@@ -729,6 +766,7 @@ def main():
             new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
             print("[main] new:", len(new_items))
 
+            # 신규 알림은 운영 채널로만
             if new_items:
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
