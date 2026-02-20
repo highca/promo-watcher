@@ -8,7 +8,12 @@ from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+SLACK_WEBHOOK_URL_PROD = os.environ.get("SLACK_WEBHOOK_URL_PROD", "").strip()
+SLACK_WEBHOOK_URL_TEST = os.environ.get("SLACK_WEBHOOK_URL_TEST", "").strip()
+
+GITHUB_SERVER_URL = os.environ.get("GITHUB_SERVER_URL", "").strip()
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "").strip()
 
 STATE_PATH = Path("state/seen.json")
 DEBUG_DIR = Path("debug")
@@ -19,7 +24,6 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# 이미 state가 쌓여있으면 False 유지 권장
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
@@ -31,9 +35,25 @@ def _stamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
 
-def post_slack(text: str):
-    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+def _run_url() -> str:
+    if GITHUB_SERVER_URL and GITHUB_REPOSITORY and GITHUB_RUN_ID:
+        return f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/actions/runs/{GITHUB_RUN_ID}"
+    return ""
+
+
+def post_slack(url: str, text: str):
+    if not url:
+        return
+    resp = requests.post(url, json={"text": text}, timeout=15)
     resp.raise_for_status()
+
+
+def post_slack_prod(text: str):
+    post_slack(SLACK_WEBHOOK_URL_PROD, text)
+
+
+def post_slack_test(text: str):
+    post_slack(SLACK_WEBHOOK_URL_TEST, text)
 
 
 def load_state() -> dict:
@@ -76,6 +96,7 @@ def _save_debug(page, prefix: str):
     except Exception:
         pass
     print("[debug] saved", str(shot), str(html))
+    return str(shot), str(html)
 
 
 def _abs_url(base: str, href: str) -> str:
@@ -114,7 +135,6 @@ def new_page(browser, *, viewport_w=1200, viewport_h=800):
 
 
 def try_close_common_popups(page):
-    # 아주 보수적으로 “닫기/×”류만 시도 (실패해도 무해)
     candidates = [
         'button:has-text("닫기")',
         'button:has-text("Close")',
@@ -288,7 +308,6 @@ def scrape_olens(page) -> list[dict]:
 
 
 def _hapakristin_find_event_list_url_from_home(page) -> str:
-    # 홈에서 /events/xxxx 형태나 이벤트 관련 링크를 최대한 넓게 찾음(숨김/푸터 포함)
     anchors = page.locator("a[href]").all()
     base = page.url
 
@@ -301,25 +320,19 @@ def _hapakristin_find_event_list_url_from_home(page) -> str:
         if not _same_host(base, url):
             continue
 
-        # /events/숫자 형태가 가장 유력
         if re.search(r"hapakristin\.co\.kr/events/\d+", url):
             candidates.append(url)
             continue
 
-        # 혹시 /events 라우팅이 다른 형태로 노출될 때 대비
         if re.search(r"hapakristin\.co\.kr/.{0,40}event", url, re.IGNORECASE):
             candidates.append(url)
 
-    # 가장 짧고 “events/숫자” 우선
     candidates = list(dict.fromkeys(candidates))
     candidates.sort(key=lambda x: (0 if re.search(r"/events/\d+", x) else 1, len(x)))
     return candidates[0] if candidates else ""
 
 
 def scrape_hapakristin(page) -> list[dict]:
-    # 하파크리스틴은 hover 메뉴가 “데스크톱 레이아웃”에서만 잘 잡히는 경우가 많아서
-    # (1) 홈에서 이벤트 리스트 URL을 직접 찾는 방식(가장 안정적)
-    # (2) 못 찾으면 /events/xxxx 후보를 시도
     home = "https://hapakristin.co.kr/"
     safe_goto(page, home, "hapakristin_home")
     try_close_common_popups(page)
@@ -327,7 +340,7 @@ def scrape_hapakristin(page) -> list[dict]:
 
     event_url = _hapakristin_find_event_list_url_from_home(page)
     if event_url:
-        print("[hapakristin] found event url from home:", event_url)
+        print("[hapakristin] found event url:", event_url)
         return scrape_list_page_anchors(
             page,
             list_url=event_url,
@@ -336,11 +349,8 @@ def scrape_hapakristin(page) -> list[dict]:
             max_items=DEFAULT_MAX_ITEMS,
         )
 
-    # 후보 접근: 과거에 잡힌 형태(/events/6824 등)들을 여러 개 시도
     guesses = [
         "https://hapakristin.co.kr/events",
-        "https://hapakristin.co.kr/events/6824",
-        "https://hapakristin.co.kr/events/1",
         "https://hapakristin.co.kr/pages/event",
     ]
 
@@ -428,13 +438,10 @@ def scrape_gemhour(page) -> list[dict]:
 
 
 def scrape_shop_winc(page) -> list[dict]:
-    # shop.winc.app은 Flutter(Web)라 첫 로딩이 흰 화면처럼 보일 수 있음.
-    # HTML에 숨겨진 nav가 있고, /event/xxx 링크가 존재할 수 있으므로 그걸 먼저 활용.
     home = "https://shop.winc.app/"
     safe_goto(page, home, "winc_home")
     page.wait_for_timeout(3500)
 
-    # 숨김 nav 포함해서 /event/숫자 링크 수집
     anchors = page.locator('a[href]').all()
     results = []
     seen = set()
@@ -473,8 +480,6 @@ def scrape_ann365(page) -> list[dict]:
     try_close_common_popups(page)
     page.wait_for_timeout(1500)
 
-    # ann365는 SALE 하위에서 이벤트 링크가 바뀌는 구조라,
-    # menu.php에서 이벤트 관련 링크를 넓게 수집
     return scrape_list_page_anchors(
         page,
         list_url=page.url,
@@ -486,19 +491,24 @@ def scrape_ann365(page) -> list[dict]:
 
 # Slack 표시명 한글화
 SITES = [
-    {"site": "O-Lens", "display": "오렌즈", "fn": ("normal", scrape_olens)},
-    {"site": "Hapa Kristin", "display": "하파크리스틴", "fn": ("desktop", scrape_hapakristin)},
-    {"site": "Lens-me", "display": "렌즈미", "fn": ("normal", scrape_lensme)},
-    {"site": "MYFiPN", "display": "마이핍앤", "fn": ("normal", scrape_myfipn)},
-    {"site": "CHUU Lens", "display": "츄렌즈", "fn": ("normal", scrape_chuulens)},
-    {"site": "Gemhour", "display": "젬아워", "fn": ("normal", scrape_gemhour)},
-    {"site": "i-sha", "display": "아이샤", "fn": ("normal", scrape_i_sha)},
-    {"site": "shop.winc.app", "display": "윙크", "fn": ("normal", scrape_shop_winc)},
-    {"site": "ann365", "display": "앤365", "fn": ("normal", scrape_ann365)},
-    {"site": "lenbling", "display": "렌블링", "fn": ("normal", scrape_lenbling)},
-    {"site": "yourly", "display": "유얼리", "fn": ("normal", scrape_yourly)},
-    {"site": "i-dol", "display": "아이돌렌즈", "fn": ("normal", scrape_i_dol)},
+    {"site": "O-Lens", "display": "오렌즈", "mode": "normal", "fn": scrape_olens},
+    {"site": "Hapa Kristin", "display": "하파크리스틴", "mode": "desktop", "fn": scrape_hapakristin},
+    {"site": "Lens-me", "display": "렌즈미", "mode": "normal", "fn": scrape_lensme},
+    {"site": "MYFiPN", "display": "마이핍앤", "mode": "normal", "fn": scrape_myfipn},
+    {"site": "CHUU Lens", "display": "츄렌즈", "mode": "normal", "fn": scrape_chuulens},
+    {"site": "Gemhour", "display": "젬아워", "mode": "normal", "fn": scrape_gemhour},
+    {"site": "i-sha", "display": "아이샤", "mode": "normal", "fn": scrape_i_sha},
+    {"site": "shop.winc.app", "display": "윙크", "mode": "normal", "fn": scrape_shop_winc},
+    {"site": "ann365", "display": "앤365", "mode": "normal", "fn": scrape_ann365},
+    {"site": "lenbling", "display": "렌블링", "mode": "normal", "fn": scrape_lenbling},
+    {"site": "yourly", "display": "유얼리", "mode": "normal", "fn": scrape_yourly},
+    {"site": "i-dol", "display": "아이돌렌즈", "mode": "normal", "fn": scrape_i_dol},
 ]
+
+# “0건이면 이상징후”로 보고 테스트 채널에 경고를 보내고 싶은 사이트
+WARN_IF_EMPTY_SITES = {
+    "Hapa Kristin",
+}
 
 
 def main():
@@ -506,7 +516,6 @@ def main():
     if "seen" not in state:
         state["seen"] = {}
 
-    print("[main] loaded state sites:", list(state["seen"].keys()))
     any_state_changed = False
 
     with sync_playwright() as p:
@@ -521,8 +530,9 @@ def main():
 
         for cfg in SITES:
             site_key = cfg["site"]
-            site_name = cfg.get("display", site_key)
-            mode, fn = cfg["fn"]
+            site_name = cfg["display"]
+            mode = cfg["mode"]
+            fn = cfg["fn"]
 
             print("\n[main] site:", site_key, "(", site_name, ")")
             start = time.time()
@@ -530,20 +540,27 @@ def main():
             context = None
             page = None
             items = []
+            failed_reason = ""
 
             try:
-                # 하파크리스틴은 데스크톱 레이아웃을 강제
                 if mode == "desktop":
                     context, page = new_page(browser, viewport_w=1400, viewport_h=900)
                 else:
                     context, page = new_page(browser, viewport_w=1200, viewport_h=800)
 
                 items = fn(page) or []
+                items = _dedup_keep_order(items)
+
+                if (site_key in WARN_IF_EMPTY_SITES) and (len(items) == 0):
+                    failed_reason = "수집 결과가 0건입니다(메뉴/구조 변경 가능)."
+
             except Exception as e:
-                print("[main] site error:", site_key, repr(e))
+                failed_reason = f"예외 발생: {repr(e)}"
+                print("[main] site error:", site_key, failed_reason)
                 if page is not None:
                     _save_debug(page, f"error_{site_key.replace(' ', '_')}")
                 items = []
+
             finally:
                 try:
                     if context is not None:
@@ -552,8 +569,16 @@ def main():
                     pass
 
             elapsed = time.time() - start
-            items = _dedup_keep_order(items)
             print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
+
+            # 실패/의심 알림은 테스트 채널로
+            if failed_reason:
+                run_url = _run_url()
+                msg = f"[수집 실패/의심] {site_name}\n사유: {failed_reason}\nRun: {run_url}".strip()
+                try:
+                    post_slack_test(msg)
+                except Exception as e:
+                    print("[main] test slack notify failed:", repr(e))
 
             seen_set = set(state["seen"].get(site_key, []))
 
@@ -570,12 +595,13 @@ def main():
             new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
             print("[main] new:", len(new_items))
 
+            # 신규 알림은 운영 채널로만
             if new_items:
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
                     url = it.get("url") or ""
                     msg = f"[{site_name} 신규 프로모션]\n{title}\n{url}".strip()
-                    post_slack(msg)
+                    post_slack_prod(msg)
                     seen_set.add(it["key"])
 
                 state["seen"][site_key] = sorted(seen_set)
