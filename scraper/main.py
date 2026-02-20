@@ -141,7 +141,7 @@ def _same_host(url_a: str, url_b: str) -> bool:
 def safe_goto(page, url: str, label: str = "", wait: str = "domcontentloaded"):
     print(f"[goto]{'['+label+']' if label else ''} {url}")
     page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(1000)
 
 
 def new_page(browser, *, viewport_w=1200, viewport_h=800):
@@ -178,9 +178,9 @@ def try_close_common_popups(page):
                 pass
 
 
-# -------------------------
+# =========================
 # 공용 수집기
-# -------------------------
+# =========================
 def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
                             exclude_patterns: list[str] | None = None,
                             max_items: int = DEFAULT_MAX_ITEMS) -> list[dict]:
@@ -226,7 +226,7 @@ def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
                                       restrict_same_host: bool = True) -> list[dict]:
     safe_goto(page, home_url, "home")
     try_close_common_popups(page)
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
 
     base = page.url
     selectors = [
@@ -271,9 +271,9 @@ def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
     return results
 
 
-# -------------------------
-# O-Lens
-# -------------------------
+# =========================
+# 사이트별
+# =========================
 def scrape_olens(page) -> list[dict]:
     url = "https://o-lens.com/event/list"
     safe_goto(page, url, "olens")
@@ -319,19 +319,12 @@ def scrape_olens(page) -> list[dict]:
     return _dedup_keep_order(results)
 
 
-# -------------------------
-# Hapa Kristin
-# -------------------------
 def _event_id_from_url(u: str) -> int:
     m = re.search(r"/events/(\d+)", u)
     return int(m.group(1)) if m else 0
 
 
 def _hapakristin_try_open_ongoing(page) -> bool:
-    """
-    hover 메뉴가 떠야 하위 목록이 DOM에 생기는 케이스가 있어,
-    '이벤트' 텍스트가 포함된 후보를 넓게 잡아 hover → '진행 중인 이벤트' 클릭 시도
-    """
     try:
         candidates = page.locator("header, nav").locator("a, button").filter(has_text=re.compile("이벤트"))
         n = min(candidates.count(), 6)
@@ -350,17 +343,12 @@ def _hapakristin_try_open_ongoing(page) -> bool:
                     return True
             except Exception:
                 continue
-
         return False
     except Exception:
         return False
 
 
 def _hapakristin_collect_header_event_ids(page) -> list[str]:
-    """
-    hover 후 생성된 header/nav 내부의 /events/<id> 링크를 수집.
-    (여기가 가장 '진행중 목록'에 가깝습니다.)
-    """
     hrefs = page.evaluate(
         """() => {
             const roots = Array.from(document.querySelectorAll('header, nav'));
@@ -385,7 +373,6 @@ def _hapakristin_collect_header_event_ids(page) -> list[str]:
             continue
         if not re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
             continue
-        # 텍스트가 너무 짧은 메뉴(예: '이벤트')는 제외
         if t in ("이벤트", "EVENT", ""):
             continue
         urls.append(absu.rstrip("/"))
@@ -398,9 +385,8 @@ def _hapakristin_collect_header_event_ids(page) -> list[str]:
 def scrape_hapakristin(page) -> list[dict]:
     safe_goto(page, "https://hapakristin.co.kr/", "hapakristin_home")
     try_close_common_popups(page)
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(1000)
 
-    # 1) hover 메뉴 성공 시: header/nav에서 진행중 목록 링크 수집
     if _hapakristin_try_open_ongoing(page):
         event_urls = _hapakristin_collect_header_event_ids(page)
         if event_urls:
@@ -409,7 +395,6 @@ def scrape_hapakristin(page) -> list[dict]:
             print("[hapakristin] events found:", len(results))
             return results
 
-    # 2) hover 실패 시: debug 저장 + 사용자 확인된 '진행 중' URL만 반환 (오수집 방지)
     _save_debug(page, "hapakristin_ongoing_menu_not_found")
     fixed = [
         "https://hapakristin.co.kr/events/6824",
@@ -421,9 +406,6 @@ def scrape_hapakristin(page) -> list[dict]:
     return results
 
 
-# -------------------------
-# Lens-me / i-sha / lenbling / yourly / i-dol
-# -------------------------
 def scrape_lensme(page) -> list[dict]:
     return scrape_list_page_anchors(
         page,
@@ -467,9 +449,6 @@ def scrape_i_dol(page) -> list[dict]:
     )
 
 
-# -------------------------
-# MYFiPN / CHUU Lens / Gemhour (배너 기반)
-# -------------------------
 def scrape_myfipn(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://www.myfipn.com/")
 
@@ -482,13 +461,10 @@ def scrape_gemhour(page) -> list[dict]:
     return scrape_main_banners_by_image_links(page, "https://gemhour.co.kr/")
 
 
-# -------------------------
-# shop.winc.app
-# -------------------------
 def scrape_shop_winc(page) -> list[dict]:
     home = "https://shop.winc.app/"
     safe_goto(page, home, "winc_home")
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
 
     anchors = page.locator("a[href]").all()
     results, seen = [], set()
@@ -522,37 +498,27 @@ def scrape_shop_winc(page) -> list[dict]:
     return results
 
 
-# -------------------------
-# ann365 (contact_event.php hub)
-# -------------------------
+# ---- ann365 최적화 포인트 ----
 def _extract_codes_from_strings(strings: list[str]) -> list[str]:
-    """
-    href/onclick/data-*/스크립트 문자열 등에서 code 값을 최대한 넓게 추출
-    """
     codes = []
     for s in strings:
         if not s:
             continue
         s = str(s)
 
-        # 1) contact_event.php?code=XXX
         for m in re.findall(r"contact_event\.php\?code=([^&\"'\s]+)", s):
             if m and m != "$code":
                 codes.append(m)
 
-        # 2) ?code=XXX (상대 링크/단축 형태)
         for m in re.findall(r"[?&]code=([^&\"'\s]+)", s):
             if m and m != "$code":
                 codes.append(m)
 
-        # 3) code:'XXX' / code="XXX"
         for m in re.findall(r"code\s*[:=]\s*['\"]([^'\"]+)['\"]", s):
             if m and m != "$code":
                 codes.append(m)
 
-    # 중복 제거 + 너무 짧은 값 정리
-    out = []
-    seen = set()
+    out, seen = [], set()
     for c in codes:
         c = c.strip()
         if len(c) < 2:
@@ -566,22 +532,23 @@ def _extract_codes_from_strings(strings: list[str]) -> list[str]:
 def scrape_ann365(page) -> list[dict]:
     base_list = "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg="
     max_pages = 15
-    max_items = 50
+    max_items = 40
 
     results = []
     seen_codes = set()
+
+    empty_streak = 0  # 연속으로 code가 안 나온 페이지 수
 
     for pg in range(1, max_pages + 1):
         list_url = f"{base_list}{pg}"
         safe_goto(page, list_url, "ann365_list")
         try_close_common_popups(page)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(900)
 
-        # 프레임이 있을 수도 있어 프레임까지 훑음
         collected_strings = []
 
+        # 메인 문서 수집
         try:
-            # 현재 문서에서 href/onclick/data-* 수집
             collected_strings += page.evaluate(
                 """() => {
                     const out = [];
@@ -593,7 +560,6 @@ def scrape_ann365(page) -> list[dict]:
                       out.push(el.getAttribute('data-url') || '');
                       out.push(el.getAttribute('data-code') || '');
                     }
-                    // 스크립트 내용도 일부 수집
                     const scripts = Array.from(document.querySelectorAll('script'));
                     for (const s of scripts){
                       const t = s.innerText || '';
@@ -605,52 +571,35 @@ def scrape_ann365(page) -> list[dict]:
         except Exception:
             pass
 
-        # 프레임 내부도 시도
-        try:
-            for fr in page.frames:
-                if fr == page.main_frame:
-                    continue
-                try:
-                    collected_strings += fr.evaluate(
-                        """() => {
-                            const out = [];
-                            const els = Array.from(document.querySelectorAll('a, button, [onclick], [data-href], [data-url], [data-code]'));
-                            for (const el of els){
-                              out.push(el.getAttribute('href') || '');
-                              out.push(el.getAttribute('onclick') || '');
-                              out.push(el.getAttribute('data-href') || '');
-                              out.push(el.getAttribute('data-url') || '');
-                              out.push(el.getAttribute('data-code') || '');
-                            }
-                            const scripts = Array.from(document.querySelectorAll('script'));
-                            for (const s of scripts){
-                              const t = s.innerText || '';
-                              if (t && t.length < 200000) out.push(t);
-                            }
-                            return out;
-                        }"""
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
         codes_this_page = _extract_codes_from_strings(collected_strings)
 
-        # 이 페이지에서 code가 하나도 안 나오면: 1페이지는 debug 저장, 이후는 종료
+        # 이번 페이지에 신규 code가 없으면 연속 카운트 + 2연속이면 종료
         if not codes_this_page:
+            empty_streak += 1
             if pg == 1:
                 _save_debug(page, "ann365_no_codes_page1")
-            break
+            if empty_streak >= 2:
+                break
+            continue
+        else:
+            empty_streak = 0
 
         # 코드별 표준 URL 생성
+        new_added = 0
         for code in codes_this_page:
             if code in seen_codes:
                 continue
             seen_codes.add(code)
             detail_url = f"https://ann365.com/contact/contact_event.php?code={code}&scategory=&pg="
             results.append({"key": f"ann365:code:{code}", "url": detail_url, "title": f"이벤트 {code}"})
+            new_added += 1
             if len(results) >= max_items:
+                break
+
+        # 이 페이지에서 신규가 0이면(전부 중복) 다음 페이지 1번만 더 보고 종료하도록 empty_streak로 처리
+        if new_added == 0:
+            empty_streak += 1
+            if empty_streak >= 2:
                 break
 
         if len(results) >= max_items:
@@ -663,9 +612,6 @@ def scrape_ann365(page) -> list[dict]:
     return results
 
 
-# =========================
-# 사이트 목록 (표시명 한글)
-# =========================
 SITES = [
     {"site": "O-Lens", "display": "오렌즈", "mode": "normal", "fn": scrape_olens},
     {"site": "Hapa Kristin", "display": "하파크리스틴", "mode": "desktop", "fn": scrape_hapakristin},
@@ -744,7 +690,6 @@ def main():
             debug_after = _list_debug_files()
             new_debug_files = debug_after - debug_before
 
-            # debug 파일이 새로 생성된 경우에만 테스트 채널 경고
             if new_debug_files:
                 run_url = _run_url()
                 picked = _filter_site_debug_files(site_key, new_debug_files)[:8]
@@ -779,7 +724,6 @@ def main():
             new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
             print("[main] new:", len(new_items))
 
-            # 신규 알림은 운영 채널로만
             if new_items:
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
