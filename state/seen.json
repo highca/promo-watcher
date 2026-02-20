@@ -13,6 +13,10 @@
       "https://hapakristin.co.kr/collections/best",
       "https://hapakristin.co.kr/collections/monthly",
       "https://hapakristin.co.kr/collections/one-day",
+      "https://hapakristin.co.kr/events/175",
+      "https://hapakristin.co.kr/events/176",
+      "https://hapakristin.co.kr/events/6824",
+      "https://hapakristin.co.kr/events/6891",
       "https://hapakristin.co.kr/pages/about-us",
       "https://hapakristin.co.kr/pages/contact-us",
       "https://hapakristin.co.kr/pages/instruction",
@@ -93,7 +97,8 @@
       "https://i-sha.kr/board/이벤트/8/"
     ],
     "shop.winc.app": [
-      "https://shop.winc.app/"
+      "https://shop.winc.app/",
+      "winc:event:145"
     ],
     "ann365": [
       "https://ann365.com/sub/menu.php"
@@ -134,6 +139,7 @@
       "https://www.i-dol.kr/bbs/content.php?co_id=privacy",
       "https://www.i-dol.kr/bbs/content.php?co_id=provision",
       "https://www.i-dol.kr/bbs/content.php?co_id=setsale",
+      "https://www.i-dol.kr/bbs/event1.php",
       "https://www.i-dol.kr/bbs/event1.php#header",
       "https://www.i-dol.kr/bbs/login.php",
       "https://www.i-dol.kr/bbs/member_confirm.php?url=register_form.php",
