@@ -65,6 +65,10 @@ def main():
 
     new_links = [u for u in links if u not in seen]
 
+    print("links:", len(links))
+    print("seen:", len(seen))
+    print("new_links:", len(new_links))
+
     # 첫 실행 도배 방지(원하시면 활성화)
     # if not seen and links:
     #     new_links = []
