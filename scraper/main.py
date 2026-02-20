@@ -140,8 +140,14 @@ def _same_host(url_a: str, url_b: str) -> bool:
 
 def safe_goto(page, url: str, label: str = "", wait: str = "domcontentloaded"):
     print(f"[goto]{'['+label+']' if label else ''} {url}")
-    page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
+    resp = page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(1000)
+    status = None
+    try:
+        status = resp.status if resp is not None else None
+    except Exception:
+        status = None
+    return status
 
 
 def new_page(browser, *, viewport_w=1200, viewport_h=800):
@@ -387,6 +393,7 @@ def scrape_hapakristin(page) -> list[dict]:
     try_close_common_popups(page)
     page.wait_for_timeout(1000)
 
+    # 1) hover 메뉴 성공 시: header/nav에서 진행중 목록 링크 수집
     if _hapakristin_try_open_ongoing(page):
         event_urls = _hapakristin_collect_header_event_ids(page)
         if event_urls:
@@ -395,11 +402,26 @@ def scrape_hapakristin(page) -> list[dict]:
             print("[hapakristin] events found:", len(results))
             return results
 
-    _save_debug(page, "hapakristin_ongoing_menu_not_found")
+    # 2) hover 실패는 '정상 fallback'이므로 debug 생성/슬랙 경고 대상이 아님
     fixed = [
         "https://hapakristin.co.kr/events/6824",
         "https://hapakristin.co.kr/events/6724",
     ]
+
+    # 고정 URL이 실제로 열리는지만 가볍게 체크 (둘 다 이상하면 그때만 debug)
+    bad = []
+    for u in fixed:
+        st = safe_goto(page, u, f"hapakristin_check_{_event_id_from_url(u)}")
+        if st is None or st >= 400:
+            bad.append((u, st))
+
+    if bad:
+        _save_debug(page, "hapakristin_fixed_url_bad")
+        _save_debug_text(
+            "hapakristin_fixed_url_bad_info",
+            "\n".join([f"{u} status={st}" for u, st in bad])
+        )
+
     print("[hapakristin] fallback fixed ids:", [_event_id_from_url(u) for u in fixed])
     results = [{"key": u, "url": u, "title": f"이벤트 {_event_id_from_url(u)}"} for u in fixed]
     print("[hapakristin] events found:", len(results))
