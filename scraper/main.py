@@ -4,7 +4,7 @@ import json
 import time
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -24,8 +24,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-# state 초기화(첫 실행 시 알림 안 보내고 상태만 저장) 모드
-# 이미 state가 쌓여있으면 False 유지 권장
+# 첫 실행 시 상태만 저장하고 알림은 보내지 않음 (이미 state가 있으면 False 권장)
 INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
@@ -113,6 +112,16 @@ def _save_debug(page, prefix: str):
     except Exception:
         pass
     print("[debug] saved", str(shot), str(html))
+
+
+def _save_debug_text(prefix: str, text: str):
+    stamp = _stamp()
+    p = DEBUG_DIR / f"{prefix}_{stamp}.txt"
+    try:
+        p.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    print("[debug] saved", str(p))
 
 
 def _abs_url(base: str, href: str) -> str:
@@ -328,33 +337,72 @@ def _event_id_from_url(u: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _parse_date_yyyymmdd(text: str) -> date | None:
+    # 2026.02.20 / 2026-02-20 / 2026/02/20
+    m = re.search(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", text)
+    if not m:
+        return None
+    y = int(m.group(1))
+    mo = int(m.group(2))
+    d = int(m.group(3))
+    try:
+        return date(y, mo, d)
+    except Exception:
+        return None
+
+
+def _extract_date_range(text: str) -> tuple[date | None, date | None]:
+    # 가장 흔한 범위 표기: 2026.02.01 ~ 2026.02.29 (또는 -)
+    # 텍스트 내 날짜 2개를 찾아서 (start,end)로 반환
+    dates = re.findall(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", text)
+    parsed = []
+    for y, mo, d in dates[:6]:
+        try:
+            parsed.append(date(int(y), int(mo), int(d)))
+        except Exception:
+            pass
+    if len(parsed) >= 2:
+        return parsed[0], parsed[1]
+    if len(parsed) == 1:
+        return parsed[0], None
+    return None, None
+
+
 def hapakristin_is_active_event(page, url: str) -> bool:
-    # 이벤트 페이지 접속 후 텍스트 기반으로 “종료/마감” 여부를 판별
     safe_goto(page, url, "hapakristin_event_check")
     try_close_common_popups(page)
     page.wait_for_timeout(1200)
 
+    # 1) 비활성/404/존재하지 않음 신호
     try:
-        text = (page.inner_text("body") or "").strip()
+        body_text = (page.inner_text("body") or "").strip()
     except Exception:
-        text = ""
+        body_text = ""
 
-    closed_keywords = [
-        "종료", "마감", "종료된", "종료되었습니다", "이벤트 종료", "마감되었습니다"
+    invalid_keywords = [
+        "존재하지", "찾을 수", "404", "not found", "페이지를 찾을 수",
+        "잘못된 접근", "유효하지", "오류가 발생",
     ]
-    active_keywords = [
-        "진행 중", "진행중", "진행 중인 이벤트"
-    ]
+    if any(k.lower() in body_text.lower() for k in invalid_keywords):
+        return False
 
-    if any(k in text for k in active_keywords):
-        if any(k in text for k in closed_keywords):
+    # 2) 종료/마감 신호
+    closed_keywords = ["종료", "마감", "종료된", "종료되었습니다", "이벤트 종료", "마감되었습니다"]
+    if any(k in body_text for k in closed_keywords):
+        return False
+
+    # 3) 기간 파싱 가능하면, 종료일이 오늘 이전이면 비활성
+    # (표현이 다양한데, 날짜가 2개 이상 있으면 보통 start~end로 쓰입니다)
+    start_dt, end_dt = _extract_date_range(body_text)
+    today = date.today()
+
+    if end_dt is not None:
+        if end_dt < today:
             return False
         return True
 
-    if any(k in text for k in closed_keywords):
-        return False
-
-    # 애매하면 일단 포함(필요 시 강화 가능)
+    # end_dt가 없고 날짜가 하나만 있다면, 그 날짜가 “종료일”인지 알기 어려워서
+    # 여기서는 보수적으로 “활성으로 간주”하되, 필요하면 규칙 강화 가능
     return True
 
 
@@ -379,47 +427,23 @@ def scrape_hapakristin(page) -> list[dict]:
         if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", url):
             event_urls.append(url.rstrip("/"))
 
-    # 홈에서 못 찾으면 알려진 후보 페이지에서 한 번 더 수집
-    if not event_urls:
-        fallback_list_pages = [
-            "https://hapakristin.co.kr/events/6824",
-            "https://hapakristin.co.kr/events/6724",
-            "https://hapakristin.co.kr/events",
-        ]
-        for list_url in fallback_list_pages:
-            try:
-                safe_goto(page, list_url, "hapakristin_events_fallback")
-                try_close_common_popups(page)
-                page.wait_for_timeout(1500)
+    # 중복 제거 + 검사 상한(속도)
+    event_urls = list(dict.fromkeys(event_urls))[:20]
 
-                anchors2 = page.locator("a[href]").all()
-                for a in anchors2:
-                    href = a.get_attribute("href") or ""
-                    url = _abs_url(page.url, href)
-                    if not url:
-                        continue
-                    if not _same_host(page.url, url):
-                        continue
-                    if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", url):
-                        event_urls.append(url.rstrip("/"))
+    # 디버깅용: 실제로 어떤 event id들이 수집되는지 로그에 남김
+    if event_urls:
+        ids = [_event_id_from_url(u) for u in event_urls]
+        print("[hapakristin] collected ids:", ids)
 
-                if event_urls:
-                    break
-            except Exception:
-                pass
-
-    # 중복 제거 + 안정용 제한
-    event_urls = list(dict.fromkeys(event_urls))
-    event_urls = event_urls[:20]
-
-    # 2차: 각 이벤트 페이지에 들어가 “진행 중”만 남김
+    # 2차: 각 이벤트 페이지 진입해서 활성만 남김
     active_urls = []
     for u in event_urls:
         try:
             if hapakristin_is_active_event(page, u):
                 active_urls.append(u)
-        except Exception:
+        except Exception as e:
             _save_debug(page, "hapakristin_event_check_fail")
+            _save_debug_text("hapakristin_event_check_fail_reason", repr(e))
 
     active_urls = list(dict.fromkeys(active_urls))
     active_urls.sort(key=_event_id_from_url, reverse=True)
@@ -498,7 +522,7 @@ def scrape_shop_winc(page) -> list[dict]:
     safe_goto(page, home, "winc_home")
     page.wait_for_timeout(3500)
 
-    anchors = page.locator('a[href]').all()
+    anchors = page.locator("a[href]").all()
     results = []
     seen = set()
 
@@ -509,9 +533,11 @@ def scrape_shop_winc(page) -> list[dict]:
             continue
         if not _same_host(page.url, url):
             continue
+
         m = re.search(r"/event/(\d+)", url)
         if not m:
             continue
+
         if url in seen:
             continue
 
@@ -531,18 +557,52 @@ def scrape_shop_winc(page) -> list[dict]:
     return results
 
 
-def scrape_ann365(page) -> list[dict]:
-    safe_goto(page, "https://ann365.com/sub/menu.php", "ann365")
-    try_close_common_popups(page)
-    page.wait_for_timeout(1500)
+def _requests_get(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT, "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"}
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
 
-    return scrape_list_page_anchors(
-        page,
-        list_url=page.url,
-        include_patterns=[r"ann365\.com/.*(prd_event=|event|이벤트|menu\.php|product/list\.php)"],
-        exclude_patterns=[],
-        max_items=DEFAULT_MAX_ITEMS,
-    )
+
+def scrape_ann365_requests() -> list[dict]:
+    """
+    ann365는 Playwright에서 about:blank/빈 DOM이 나올 수 있어 requests로 처리.
+    핵심은 menu.php에서 prd_event= 파라미터를 가진 링크를 찾아 그 이벤트 id를 모니터링하는 것.
+    """
+    menu_url = "https://ann365.com/sub/menu.php"
+    try:
+        html = _requests_get(menu_url)
+    except Exception as e:
+        _save_debug_text("ann365_request_fail", f"menu fetch fail: {repr(e)}")
+        return []
+
+    # prd_event= 숫자 추출
+    ids = re.findall(r"prd_event=(\d+)", html)
+    ids = list(dict.fromkeys(ids))
+
+    # 그래도 못 찾으면, menu.php 안에 product/list.php 링크가 있을 수 있으니 href 자체로 추출
+    if not ids:
+        m = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
+        for href in m:
+            if "prd_event=" in href:
+                mm = re.search(r"prd_event=(\d+)", href)
+                if mm:
+                    ids.append(mm.group(1))
+        ids = list(dict.fromkeys(ids))
+
+    if not ids:
+        _save_debug_text("ann365_no_prd_event", "menu.php에서 prd_event 링크를 찾지 못했습니다.")
+        return []
+
+    # 가장 대표 이벤트(보통 1개)만 쓰되, 여러 개면 전부 모니터링도 가능
+    # 여기서는 전부 반환 (향후 이벤트 탭 여러 개일 수도 있어서)
+    results = []
+    for ev_id in ids[:10]:
+        url = f"https://ann365.com/product/list.php?prd_event={ev_id}"
+        results.append({"key": f"ann365:prd_event:{ev_id}", "url": url, "title": f"이벤트 {ev_id}"})
+
+    print("[ann365] prd_event found:", len(results), ids[:10])
+    return results
 
 
 SITES = [
@@ -554,7 +614,8 @@ SITES = [
     {"site": "Gemhour", "display": "젬아워", "mode": "normal", "fn": scrape_gemhour},
     {"site": "i-sha", "display": "아이샤", "mode": "normal", "fn": scrape_i_sha},
     {"site": "shop.winc.app", "display": "윙크", "mode": "normal", "fn": scrape_shop_winc},
-    {"site": "ann365", "display": "앤365", "mode": "normal", "fn": scrape_ann365},
+    # ann365는 requests 기반이므로 mode는 무시되지만 통일감 있게 normal로 둠
+    {"site": "ann365", "display": "앤365", "mode": "normal", "fn": lambda page: scrape_ann365_requests()},
     {"site": "lenbling", "display": "렌블링", "mode": "normal", "fn": scrape_lenbling},
     {"site": "yourly", "display": "유얼리", "mode": "normal", "fn": scrape_yourly},
     {"site": "i-dol", "display": "아이돌렌즈", "mode": "normal", "fn": scrape_i_dol},
@@ -586,7 +647,6 @@ def main():
 
             print("\n[main] site:", site_key, "(", site_name, ")")
 
-            # 사이트 실행 전 debug 파일 목록 스냅샷
             debug_before = _list_debug_files()
 
             start = time.time()
@@ -596,7 +656,7 @@ def main():
             site_exception = ""
 
             try:
-                # 하파크리스틴은 데스크톱 레이아웃을 강제(hover/레이아웃 영향을 줄이기 위해)
+                # ann365는 requests라 page가 필요 없지만, 다른 사이트와 동일 흐름 유지를 위해 page를 만듭니다.
                 if mode == "desktop":
                     context, page = new_page(browser, viewport_w=1400, viewport_h=900)
                 else:
@@ -622,10 +682,10 @@ def main():
             elapsed = time.time() - start
             print("[main] scraped:", len(items), f"elapsed={elapsed:.1f}s")
 
-            # 사이트 실행 후 debug 파일 목록 비교 → 새 파일 있을 때만 테스트 채널 경고
             debug_after = _list_debug_files()
             new_debug_files = debug_after - debug_before
 
+            # debug 파일이 새로 생성된 경우에만 테스트 채널 경고
             if new_debug_files:
                 run_url = _run_url()
                 picked = _filter_site_debug_files(site_key, new_debug_files)[:8]
