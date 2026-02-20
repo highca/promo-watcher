@@ -135,9 +135,9 @@ def _same_host(url_a: str, url_b: str) -> bool:
         return False
 
 
-def safe_goto(page, url: str, label: str = ""):
+def safe_goto(page, url: str, label: str = "", wait: str = "domcontentloaded"):
     print(f"[goto]{'['+label+']' if label else ''} {url}")
-    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    page.goto(url, wait_until=wait, timeout=NAV_TIMEOUT_MS)
     page.wait_for_timeout(1200)
 
 
@@ -148,6 +148,14 @@ def new_page(browser, *, viewport_w=1200, viewport_h=800):
         timezone_id="Asia/Seoul",
         viewport={"width": viewport_w, "height": viewport_h},
     )
+
+    # headless 탐지 회피(가벼운 수준)
+    context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """
+    )
+
     page = context.new_page()
     page.set_default_timeout(ACTION_TIMEOUT_MS)
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
@@ -173,10 +181,6 @@ def try_close_common_popups(page):
             except Exception:
                 pass
 
-
-# -----------------------------
-# 공용 수집기
-# -----------------------------
 
 def scrape_list_page_anchors(page, list_url: str, include_patterns: list[str],
                             exclude_patterns: list[str] | None = None,
@@ -268,10 +272,6 @@ def scrape_main_banners_by_image_links(page, home_url: str, max_items: int = 20,
     return results
 
 
-# -----------------------------
-# 사이트별 스크레이퍼
-# -----------------------------
-
 def scrape_olens(page) -> list[dict]:
     url = "https://o-lens.com/event/list"
     safe_goto(page, url, "olens")
@@ -322,109 +322,120 @@ def _event_id_from_url(u: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _collect_events_from_main_content(page) -> list[str]:
+def _hapakristin_try_open_ongoing(page) -> bool:
     """
-    header/nav/footer 안의 링크, 그리고 '이전/다음' 류 네비게이션 링크를 제외하고
-    메인 콘텐츠 영역에서만 /events/<id> 링크를 수집합니다.
+    hover로 하위 메뉴가 생성되는 경우를 최대한 커버:
+    - header/nav 영역에서 '이벤트'에 hover
+    - '진행 중인 이벤트' 클릭
     """
-    hrefs = page.evaluate(
+    try:
+        # '이벤트' 후보를 넓게 잡고, 화면에 보이는(first) 것을 hover
+        evt_candidates = page.locator("header, nav").locator("text=이벤트")
+        if evt_candidates.count() == 0:
+            return False
+
+        evt = evt_candidates.first
+        evt.hover(timeout=6_000)
+        page.wait_for_timeout(700)
+
+        ongoing = page.locator("text=진행 중인 이벤트").first
+        ongoing.click(timeout=6_000)
+        page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
+
+
+def _hapakristin_collect_event_links_strict(page) -> list[str]:
+    """
+    하파크리스틴 오수집을 줄이기 위한 '강한' 수집:
+    - header/nav/footer 안 링크 제외
+    - 이전/다음 네비 링크 제외
+    - 이미지(img)를 포함한 a 태그만 우선 수집 (이벤트 배너/카드형)
+    - /events/<id> 링크만
+    """
+    data = page.evaluate(
         """() => {
             const out = [];
-            const as = Array.from(document.querySelectorAll('a[href]'));
-            for (const a of as) {
+            const anchors = Array.from(document.querySelectorAll('a[href]'));
+            for (const a of anchors) {
               if (a.closest('header, nav, footer')) continue;
 
-              // "이전/다음" 네비게이션 성격은 제외
               const t = (a.innerText || '').trim();
               if (t.includes('이전') || t.includes('다음')) continue;
 
-              // 클래스/aria 기준으로도 prev/next 제외
               const cls = (a.className || '').toString().toLowerCase();
               const aria = (a.getAttribute('aria-label') || '').toLowerCase();
               if (cls.includes('prev') || cls.includes('next') || aria.includes('prev') || aria.includes('next')) continue;
 
-              out.push(a.getAttribute('href') || '');
+              // 이벤트 배너/카드 성격: 이미지 포함 링크 우선
+              const hasImg = a.querySelector('img') !== null;
+              const href = a.getAttribute('href') || '';
+
+              out.push({href, hasImg});
             }
             return out;
         }"""
     )
 
     base = page.url
-    urls = []
-    for href in hrefs:
+    img_urls = []
+    text_urls = []
+
+    for row in data:
+        href = (row.get("href") or "").strip()
+        if not href:
+            continue
         absu = _abs_url(base, href)
-        if not absu:
+        if not absu or not _same_host(base, absu):
             continue
-        if not _same_host(base, absu):
+        if not re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
             continue
-        if re.search(r"^https://hapakristin\.co\.kr/events/\d+/?$", absu):
-            urls.append(absu.rstrip("/"))
-    return list(dict.fromkeys(urls))
 
+        if row.get("hasImg"):
+            img_urls.append(absu.rstrip("/"))
+        else:
+            text_urls.append(absu.rstrip("/"))
 
-def _hapakristin_open_ongoing(page) -> bool:
-    """
-    하파크리스틴은 GNB hover로 하위 메뉴가 뜨는 구조일 수 있어
-    1) header/nav에서 '이벤트' hover
-    2) '진행 중인 이벤트' 클릭
-    을 시도합니다.
-    성공하면 True.
-    """
-    try:
-        # header/nav 범위 안에서 "이벤트"를 최대한 좁혀 찾기
-        evt = page.locator("header, nav").locator('text=이벤트').first
-        evt.hover(timeout=6_000)
-        page.wait_for_timeout(700)
+    # 이미지 포함 링크가 있으면 그것만 사용 (오수집 억제)
+    urls = img_urls if img_urls else text_urls
 
-        ongoing = page.locator('text=진행 중인 이벤트').first
-        ongoing.click(timeout=6_000)
-        page.wait_for_load_state("domcontentloaded", timeout=20_000)
-        page.wait_for_timeout(1000)
-        return True
-    except Exception:
-        return False
+    urls = list(dict.fromkeys(urls))
+    urls.sort(key=_event_id_from_url, reverse=True)
+    return urls[:20]
 
 
 def scrape_hapakristin(page) -> list[dict]:
-    """
-    개선 포인트
-    - 메뉴 텍스트가 a에 없을 수 있어 hover/click로 진입
-    - 수집 범위는 header/nav/footer 제외한 메인 콘텐츠로 제한
-    """
     safe_goto(page, "https://hapakristin.co.kr/", "hapakristin_home")
     try_close_common_popups(page)
     page.wait_for_timeout(1200)
 
-    ok = _hapakristin_open_ongoing(page)
+    ok = _hapakristin_try_open_ongoing(page)
     if not ok:
         _save_debug(page, "hapakristin_ongoing_menu_not_found")
-        # 그래도 실제 진행중 목록이 있는 것으로 확인된 페이지로 fallback 진입
+        # 사용자 확인된 진행중 이벤트 페이지로 fallback
         safe_goto(page, "https://hapakristin.co.kr/events/6824", "hapakristin_fallback_6824")
         try_close_common_popups(page)
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1200)
 
-    # 현재 페이지(진행중 이벤트 페이지)에서만 수집
-    event_urls = _collect_events_from_main_content(page)
+    # 1차: 현재 페이지에서 엄격 수집
+    event_urls = _hapakristin_collect_event_links_strict(page)
 
-    # 그래도 0이면 두번째 fallback(6724)에서 재시도
+    # 2차: 그래도 0이면 6724에서 재시도
     if not event_urls:
         safe_goto(page, "https://hapakristin.co.kr/events/6724", "hapakristin_fallback_6724")
         try_close_common_popups(page)
-        page.wait_for_timeout(1000)
-        event_urls = _collect_events_from_main_content(page)
-
-    # 정렬/상한
-    event_urls = list(dict.fromkeys(event_urls))
-    event_urls.sort(key=_event_id_from_url, reverse=True)
-    event_urls = event_urls[:20]
+        page.wait_for_timeout(1200)
+        event_urls = _hapakristin_collect_event_links_strict(page)
 
     if event_urls:
         print("[hapakristin] collected ids:", [_event_id_from_url(u) for u in event_urls])
+    else:
+        _save_debug(page, "hapakristin_no_event_links")
 
     results = [{"key": u, "url": u, "title": f"이벤트 {_event_id_from_url(u)}"} for u in event_urls]
     print("[hapakristin] events found:", len(results))
-    if not results:
-        _save_debug(page, "hapakristin_events_no_results")
     return results
 
 
@@ -533,6 +544,11 @@ def _requests_get(url: str) -> str:
     return r.text
 
 
+def _jina_proxy_url(url: str) -> str:
+    # 예: https://r.jina.ai/https://ann365.com/sub/menu.php
+    return "https://r.jina.ai/" + url
+
+
 def _extract_ann365_prd_event_ids(html: str) -> list[str]:
     ids = re.findall(r"prd_event=(\d+)", html)
     ids = list(dict.fromkeys(ids))
@@ -551,16 +567,23 @@ def scrape_ann365(page) -> list[dict]:
     menu_url = "https://ann365.com/sub/menu.php"
     html = ""
 
-    # 1) requests 우선
+    # 1) requests
     try:
         html = _requests_get(menu_url)
     except Exception as e:
         _save_debug_text("ann365_request_fail", f"{menu_url}\n{repr(e)}")
 
-    # 2) playwright fallback (networkidle까지)
+    # 2) jina 프록시
     if not html:
         try:
-            safe_goto(page, menu_url, "ann365_menu_pw")
+            html = _requests_get(_jina_proxy_url(menu_url))
+        except Exception as e:
+            _save_debug_text("ann365_jina_fail", f"{_jina_proxy_url(menu_url)}\n{repr(e)}")
+
+    # 3) playwright (networkidle)
+    if not html:
+        try:
+            safe_goto(page, menu_url, "ann365_menu_pw", wait="domcontentloaded")
             try_close_common_popups(page)
             try:
                 page.wait_for_load_state("networkidle", timeout=25_000)
@@ -574,8 +597,8 @@ def scrape_ann365(page) -> list[dict]:
             return []
 
     if not html or len(html.strip()) < 200:
-        # html이 너무 빈 경우는 바로 debug 남김
         _save_debug(page, "ann365_empty_html")
+        _save_debug_text("ann365_empty_html_info", f"len={len(html.strip())}")
         return []
 
     ids = _extract_ann365_prd_event_ids(html)
@@ -706,7 +729,6 @@ def main():
             new_items = [it for it in items if it.get("key") and it["key"] not in seen_set]
             print("[main] new:", len(new_items))
 
-            # 신규 알림은 운영 채널로만
             if new_items:
                 for it in new_items[:10]:
                     title = (it.get("title") or "").strip()
