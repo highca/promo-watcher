@@ -20,7 +20,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-INIT_SILENT = True
+INIT_SILENT = False
 
 DEFAULT_MAX_ITEMS = 30
 SITE_TIMEOUT_SEC = 35   # 사이트 하나당 최대 처리 시간(초)
