@@ -1,0 +1,1 @@
+menu fetch fail: SSLError(MaxRetryError("HTTPSConnectionPool(host='ann365.com', port=443): Max retries exceeded with url: /sub/menu.php (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1016)')))"))
