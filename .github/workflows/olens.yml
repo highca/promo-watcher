@@ -2,15 +2,17 @@ name: O-Lens Event Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # 15분마다 (UTC 기준)
+    - cron: "*/15 * * * *"   # 15분마다(UTC)
   workflow_dispatch:
 
 permissions:
-  contents: write   # state 파일 자동 커밋을 위해 필요
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
