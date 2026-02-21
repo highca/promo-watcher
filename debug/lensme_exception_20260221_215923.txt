@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://www.lens-me.com/shop/board.php?ps_bbscuid=17" is interrupted by another navigation to "https://hapakristin.co.kr/"\nCall log:\n  - navigating to "https://www.lens-me.com/shop/board.php?ps_bbscuid=17", waiting until "domcontentloaded"\n')
