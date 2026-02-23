@@ -348,7 +348,7 @@ def scrape_myfipn(page) -> List[Item]:
     return scrape_banner(
         page=page,
         site_key="myfipn",
-        site_name="마이핍앤",
+        site_name="마이피픈",
         home_url="https://www.myfipn.com/",
         base="https://www.myfipn.com",
         allow_patterns=[r"/event", r"/promotion", r"/board", r"/pages", r"/collections", r"/product", r"/products"],
@@ -557,7 +557,7 @@ def main():
             ("olens", "오렌즈", lambda: scrape_olens(page)),
             ("hapakristin", "하파크리스틴", None),  # 특별 처리
             ("lensme", "렌즈미", lambda: scrape_lensme(page)),
-            ("myfipn", "마이핍앤", lambda: scrape_myfipn(page)),
+            ("myfipn", "마이피픈", lambda: scrape_myfipn(page)),
             ("chuulens", "츄렌즈", lambda: scrape_chuulens(page)),
             ("gemhour", "젬아워", lambda: scrape_gemhour(page)),
             ("isha", "아이샤", lambda: scrape_isha(page)),
