@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg=1" is interrupted by another navigation to "https://www.i-dol.kr/bbs/event1.php"\nCall log:\n  - navigating to "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg=1", waiting until "domcontentloaded"\n')
