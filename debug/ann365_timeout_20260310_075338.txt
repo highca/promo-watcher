@@ -1,0 +1,3 @@
+Page.goto: Timeout 35000ms exceeded.
+Call log:
+  - navigating to "https://ann365.com/contact/contact_event.php?code=$code&scategory=&pg=1", waiting until "domcontentloaded"
