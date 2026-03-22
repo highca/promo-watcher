@@ -1,0 +1,3 @@
+Page.goto: Timeout 35000ms exceeded.
+Call log:
+  - navigating to "https://i-sha.kr/board/%EC%9D%B4%EB%B2%A4%ED%8A%B8/8/", waiting until "domcontentloaded"
