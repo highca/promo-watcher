@@ -1,0 +1,3 @@
+Page.goto: Timeout 35000ms exceeded.
+Call log:
+  - navigating to "https://www.myfipn.com/", waiting until "domcontentloaded"
