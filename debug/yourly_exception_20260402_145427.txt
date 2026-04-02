@@ -1,0 +1,1 @@
+Error('Page.goto: net::ERR_TIMED_OUT at https://yourly.kr/board/event\nCall log:\n  - navigating to "https://yourly.kr/board/event", waiting until "domcontentloaded"\n')
