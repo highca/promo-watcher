@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://gemhour.co.kr/" is interrupted by another navigation to "https://chuulens.kr/"\nCall log:\n  - navigating to "https://gemhour.co.kr/", waiting until "domcontentloaded"\n')
