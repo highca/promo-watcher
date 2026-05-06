@@ -5,6 +5,7 @@
   "ann365_exception_20260307_175620.txt",
   "ann365_exception_20260402_145428.txt",
   "ann365_exception_20260414_001014.txt",
+  "ann365_exception_20260506_094207.txt",
   "ann365_timeout_20260310_075338.txt",
   "chuulens_exception_20260220_201720.txt",
   "chuulens_exception_20260221_215924.txt",
@@ -20,6 +21,7 @@
   "idol_exception_20260225_045213.txt",
   "idol_exception_20260402_145428.txt",
   "idol_exception_20260414_001013.txt",
+  "idol_exception_20260506_094207.txt",
   "idol_timeout_20260419_000624.txt",
   "isha_exception_20260220_201722.txt",
   "isha_exception_20260221_215926.txt",
@@ -42,5 +44,6 @@
   "yourly_exception_20260221_215929.txt",
   "yourly_exception_20260225_045212.txt",
   "yourly_exception_20260402_145427.txt",
-  "yourly_exception_20260414_001012.txt"
+  "yourly_exception_20260414_001012.txt",
+  "yourly_exception_20260506_094205.txt"
 ]
