@@ -1,0 +1,1 @@
+Error('Page.goto: Navigation to "https://www.i-dol.kr/bbs/event1.php" is interrupted by another navigation to "https://yourly.kr/board/event"\nCall log:\n  - navigating to "https://www.i-dol.kr/bbs/event1.php", waiting until "domcontentloaded"\n')
